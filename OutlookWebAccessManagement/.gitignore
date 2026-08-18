@@ -1,0 +1,16 @@
+﻿# Config file - contains tenant ID, application ID, and certificate thumbprint. Local only.
+config.psd1
+
+# Persistent state - contain user PII (names, UPNs)
+BlockedUsers.psd1
+
+# Certificates - never commit private keys or exported certs
+*.pfx
+*.cer
+*.crt
+
+# Editor / OS cruft
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
