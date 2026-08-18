@@ -56,13 +56,12 @@
 
 [CmdletBinding(SupportsShouldProcess)]
 param (
-    [switch]$AutomaticallyRemediate,
-    [string]$CustomLogPath
+    [switch]$AutomaticallyRemediate
 )
 
 ########## Script Variable Definitions ##########
 $Script:startTime = Get-Date
-[string]$Script:logPath = if ($CustomLogPath) { $CustomLogPath.Replace("/", "\") } else { "C:\tmp\WSUS\WSUS-ClientSync.log" }
+[string]$Script:logPath = "C:\Pickering-Cloud\Logs\WSUS-Client\WSUS-ClientSync.log"
 [string]$Script:eventLogSource = "WSUS Client Sync Script"
 [string]$Script:eventLogName = "Application"
 [Nullable[int]]$loggingLevel = $null

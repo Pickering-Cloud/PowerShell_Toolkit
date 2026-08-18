@@ -145,6 +145,65 @@ param (
     [switch]$BuildConfig
 )
 
+##################################################
+# Logging
+##################################################
+
+$date = Get-Date -Format "yyyyMMdd"
+$logPath = "C:\Pickering-Cloud\Logs\FileSigning\$($date).log"
+
+function Configure-LogPath {
+    $logDir = Split-Path -Path $logPath -Parent
+
+    if (-not (Test-Path $logDir)) {
+        Try {
+            New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null
+        }
+        Catch {
+            Write-Error "Failed creating log path: $logDir"
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Write-Log {
+    <#
+    .SYNOPSIS
+        Writes a message to the persistent log file and the appropriate PowerShell stream.
+    .DESCRIPTION
+        INFO writes to the file and to Write-Verbose (respects -Verbose / $VerbosePreference).
+        WARN and ERROR both write to the file and to Write-Warning (respects -WarningAction);
+        the distinction between them only exists in the log file itself, since PowerShell has
+        no separate built-in stream for "worse than a warning but non-fatal".
+        CRITICAL writes to the file, writes a warning, then exits the script with code 1.
+    #>
+    param (
+        [Parameter(Mandatory)]
+        [string]$Message,
+        [ValidateSet("INFO", "WARN", "ERROR", "CRITICAL")]
+        [string]$Level = "INFO"
+    )
+    $prefix = "[$Level]"
+
+    if (Configure-LogPath) {
+        $time = Get-Date -Format "HH:mm:SS.zzz"
+        $entry = "$time | $prefix | $Message"
+        Add-Content -Value $entry -Path $logPath
+    }
+    else {
+        Write-Host "$prefix | $Message (log file unavailable)" -ForegroundColor Red
+    }
+
+    switch ($Level) {
+        "WARN"     { Write-Warning $Message }
+        "ERROR"    { Write-Warning $Message }
+        "CRITICAL" { Write-Warning $Message; exit 1 }
+        default    { Write-Verbose $Message }
+    }
+}
+
 #############################################################################################
 
 # Functions
@@ -193,7 +252,7 @@ function New-SignFileConfig {
     }
     if ($PSCmdlet.ShouldProcess($ConfigFilePath, 'Write config file')) {
         $configTemplate | ConvertTo-Json -Depth 3 | Set-Content -Path $ConfigFilePath -Encoding UTF8 -Force
-        Write-Verbose "Config file written to '$ConfigFilePath'."
+        Write-Log -Message "Config file written to '$ConfigFilePath'."
     }
 }
 
@@ -220,10 +279,10 @@ function Test-Prerequisites {
     [CmdletBinding()]
     param()
     if (-not (Get-Module -ListAvailable -Name PKI)) {
-        throw "The PKI module is not available on this machine. It ships with the AD CS Remote Server Administration Tools feature (Windows 8.1 / Server 2012 R2 and later). Enable it via 'Add-WindowsFeature RSAT-ADCS' (Server) or the Windows Optional Features UI (client), then re-run this script."
+        Write-Log -Message "The PKI module is not available on this machine. It ships with the AD CS Remote Server Administration Tools feature (Windows 8.1 / Server 2012 R2 and later). Enable it via 'Add-WindowsFeature RSAT-ADCS' (Server) or the Windows Optional Features UI (client), then re-run this script." -Level CRITICAL
     }
     Import-Module -Name PKI -Scope Local -ErrorAction Stop
-    Write-Verbose "PKI module loaded successfully."
+    Write-Log -Message "PKI module loaded successfully."
 }
 
 ## Script Variables
@@ -293,18 +352,18 @@ function Get-ScriptVariables {
     centrally and developers cannot silently override them by passing different switches.
     ##>
     if (Test-Path -Path $configFilePath) {
-        Write-Verbose "Loading configuration from $($configFilePath)"
+        Write-Log -Message "Loading configuration from $configFilePath"
 
         try {
             $config = Get-Content -Path $configFilePath -Raw | ConvertFrom-Json -ErrorAction Stop
         } 
         catch {
-            throw "Failed to parse config file $($configFilePath): $($_.Exception.Message)"
+            Write-Log -Message "Failed to parse config file $($configFilePath): $($_.Exception.Message)" -Level CRITICAL
         }
 
         if ($null -ne $config.RequireADCSCertificate) {
             if ($RequireADCSCertificate.IsPresent -and (-not $config.RequireADCSCertificate)) {
-                    Write-Warning "RequireADCSCertificate was requested at the command line but config policy overrides it. Policy value in use: $($config.RequireADCSCertificate)."
+                Write-Log -Message "RequireADCSCertificate was requested at the command line but config policy overrides it. Policy value in use: $($config.RequireADCSCertificate)." -Level WARN
             }
             $requireADCSCertificate = [bool]$config.RequireADCSCertificate
         }
@@ -335,7 +394,7 @@ function Get-ScriptVariables {
 
     }
     else {
-        Write-Verbose "No config file found at $($ConfigFilePath). Using command line parameters and defaults."
+        Write-Log -Message "No config file found at $ConfigFilePath. Using command line parameters and defaults."
     }
 
     $CertificateStore = if ($UsePersonalCertificate) { 'Cert:\CurrentUser\My' } else { 'Cert:\LocalMachine\My' }
@@ -392,14 +451,16 @@ function Get-ExistingCodeSigningCert {
         }
         
         if ($codeSigningCert) {
+            Write-Log -Message "Found existing usable code signing certificate: $($codeSigningCert.Thumbprint), expires $($codeSigningCert.NotAfter)."
             return $codeSigningCert
         }
         else {
+            Write-Log -Message "No usable existing code signing certificate found in $CertificateStore."
             return $false
         }
     }
     catch {
-    Write-Warning "Checking for existing code signing certificate failed: $($_.Exception.Message)"
+        Write-Log -Message "Checking for existing code signing certificate failed: $($_.Exception.Message)" -Level WARN
         return $false
     }
 }
@@ -544,9 +605,10 @@ function New-CodesigningCert {
                     if ($result.Status -eq 'Issued') {
                         Remove-Item -Path $PendingStateFile -Force
                         $newCert = $result.Certificate
+                        Write-Log -Message "Previously pending ADCS request (thumbprint $($state.Thumbprint)) is now issued."
                     }
                     else {
-                        Write-Warning "Request $($state.Thumbprint) is still $($result.Status). Re-run once approved."
+                        Write-Log -Message "Request $($state.Thumbprint) is still $($result.Status). Re-run once approved." -Level WARN
                         return
                     }
                 }
@@ -571,10 +633,11 @@ function New-CodesigningCert {
                 switch ($result.Status) {
                     'Issued' {
                         $newCert = $result.Certificate
+                        Write-Log -Message "ADCS issued certificate $($newCert.Thumbprint) using template '$CertTemplate'."
                     }
                     'Pending' {
                         $thumbprint = $result.Request.Thumbprint
-                        Write-Warning "Request submitted but requires CA manager approval (thumbprint: $($thumbprint)). Re-run once approved."
+                        Write-Log -Message "Request submitted but requires CA manager approval (thumbprint: $thumbprint). Re-run once approved." -Level WARN
                         @{ Thumbprint = $thumbprint; SubmittedUtc = (Get-Date).ToUniversalTime().ToString('o') } |
                             ConvertTo-Json | Set-Content -Path $PendingStateFile -Encoding UTF8
                         return
@@ -590,13 +653,14 @@ function New-CodesigningCert {
     # If ADCS was unreachable or the request failed, fall back to self-signed
     catch {
         if ($ADCSRequired) {
-            throw "ADCSRequired is set but a certificate could not be obtained from ADCS: $($_.Exception.Message)"
+            Write-Log -Message "ADCSRequired is set but a certificate could not be obtained from ADCS: $($_.Exception.Message)" -Level CRITICAL
         }
 
-        Write-Warning "ADCS certificate unavailable, falling back to self-signed: $($_.Exception.Message)"
+        Write-Log -Message "ADCS certificate unavailable, falling back to self-signed: $($_.Exception.Message)" -Level WARN
 
         if ($PSCmdlet.ShouldProcess("CN=$CompanyName", 'Create self-signed code signing certificate')) {
             $newCert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=$($CompanyName)" -CertStoreLocation $CertStore -KeySpec Signature -KeyUsage DigitalSignature -KeyLength $KeyLength -HashAlgorithm SHA256 -NotAfter ((Get-Date).AddYears($ValidityLength)) -FriendlyName "Self-signed code signing cert - generated $(Get-Date -Format 'yyyy-MM-dd')" -KeyExportPolicy Exportable
+            Write-Log -Message "Self-signed certificate created: $($newCert.Thumbprint), expires $($newCert.NotAfter)." -Level WARN
         }
         $storeLocation = [System.Security.Cryptography.X509Certificates.StoreLocation]::$Scope
 
@@ -607,7 +671,7 @@ function New-CodesigningCert {
                 try {
                     $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
                     $store.Add($newCert)
-                    Write-Verbose "Added $($newCert.Thumbprint) to Cert:\$Scope\$storeName."
+                    Write-Log -Message "Added $($newCert.Thumbprint) to Cert:\$Scope\$storeName."
                 }
                 finally {
                     $store.Close()
@@ -659,9 +723,9 @@ function Get-FileToSign {
         [Parameter()]
         [string]$Path
     )
-    if ($Path) {
+        if ($Path) {
         if (-not (Test-Path -Path $Path -PathType Leaf)) {
-            Write-Warning "No file found at '$Path'. Falling back to interactive file picker."
+            Write-Log -Message "No file found at '$Path'. Falling back to interactive file picker." -Level WARN
         }
         else {
             return @((Resolve-Path -Path $Path).ProviderPath)
@@ -671,7 +735,7 @@ function Get-FileToSign {
         Write-Verbose "No -Path supplied, opening file picker."
     }
     if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
-        Write-Warning "PowerShell is not running in STA mode. The file picker may fail or behave unexpectedly. If it does, restart with 'pwsh.exe -STA' (or 'powershell.exe -STA' on Windows PowerShell)."
+        Write-Log -Message "PowerShell is not running in STA mode. The file picker may fail or behave unexpectedly. If it does, restart with 'pwsh.exe -STA' (or 'powershell.exe -STA' on Windows PowerShell)." -Level WARN
     }
     Add-Type -AssemblyName System.Windows.Forms
     $dialog = [System.Windows.Forms.OpenFileDialog]::new()
@@ -681,12 +745,11 @@ function Get-FileToSign {
     $dialog.FilterIndex = 1
     $result = $dialog.ShowDialog()
     if ($result -ne [System.Windows.Forms.DialogResult]::OK -or $dialog.FileNames.Count -eq 0) {
-        Write-Warning "No files selected."
+        Write-Log -Message "No files selected." -Level WARN
         return @()
     }
-    Write-Verbose "$($dialog.FileNames.Count) file(s) selected."
+    Write-Log -Message "$($dialog.FileNames.Count) file(s) selected."
     return $dialog.FileNames
-}
 
 # Sign file(s)
 function Set-FileSignature {
@@ -725,7 +788,7 @@ function Set-FileSignature {
         [Parameter()]
         [string]$TimestampServer
     )
-    $failures = @()
+        $failures = @()
     foreach ($file in $FileList) {
         $signParams = @{
             Certificate   = $SigningCertificate
@@ -739,64 +802,69 @@ function Set-FileSignature {
         if ($PSCmdlet.ShouldProcess($file, 'Sign file')) {
             $result = Set-AuthenticodeSignature @signParams
             if ($result.Status -eq 'Valid') {
-                Write-Verbose "Signed successfully: $($file)"
+                Write-Log -Message "Signed successfully: $file"
             }
             else {
                 $failures += $file
-                Write-Warning "Failed to sign $($file). Status: $($result.Status). $($result.StatusMessage)"
+                Write-Log -Message "Failed to sign $file. Status: $($result.Status). $($result.StatusMessage)" -Level ERROR
             }
         }
     }
     if ($failures) {
-        Write-Warning "$($failures.Count) of $($fileList.Count) file(s) failed to sign."
+        Write-Log -Message "$($failures.Count) of $($fileList.Count) file(s) failed to sign." -Level WARN
     }
     return [PSCustomObject]@{
         Total     = $fileList.Count
         Succeeded = $fileList.Count - $failures.Count
         Failed    = $failures
     }
-}
 
 #############################################################################################
 
 # Main script
-## Build Config file
-if ($BuildConfig) {
-    New-SignFileConfig
-    exit 0
+
+Write-Log -Message "FileSigning script started."
+
+try {
+    ## Build Config file
+    if ($BuildConfig) {
+        New-SignFileConfig
+        Write-Log -Message "Config file built via -BuildConfig; exiting without signing."
+        exit 0
+    }
+
+    ## Check for prerequesites
+    Test-Prerequisites 
+
+    ## Initialise variables
+    $variables = Get-ScriptVariables -RequireADCSCertificate:$RequireADCSCertificate -UsePersonalCertificate:$UsePersonalCertificate -ConfigFilePath $ConfigFilePath -validityLength $CertificateValidity -certTemplate $CodeSigningTemplate -companyName $CompanyName -keyLength $KeyLength -timestampServer $TimestampingAuthority
+
+    ## Check/generate code signing cert
+    $codeSigningCert = Get-ExistingCodeSigningCert -CertificateStore $variables.CertificateStore
+    if (-not $codeSigningCert) {
+        $codeSigningCert = New-CodesigningCert -CertStore $variables.CertificateStore -ADCSRequired:$variables.RequireADCSCertificate -CompanyName $variables.CompanyName -KeyLength $variables.KeyLength -ValidityLength $variables.ValidityLength -CertTemplate $variables.CertTemplate
+    }
+
+    if (-not $codeSigningCert) {
+        Write-Log -Message "No usable code signing certificate available (request may be pending CA approval)." -Level CRITICAL
+    }
+
+    ## Find files to be signed
+    $filesToSign = Get-FileToSign -Path $Path
+
+    if (-not $filesToSign) {
+        Write-Log -Message "No files chosen to sign." -Level CRITICAL
+    }
+
+    ## Sign files
+    $signResult = Set-FileSignature -FileList $filesToSign -SigningCertificate $codeSigningCert -TimestampServer $variables.timestampServer
+
+    if ($signResult.Failed) {
+        Write-Log -Message "$($signResult.Failed.Count) of $($signResult.Total) file(s) failed to sign." -Level CRITICAL
+    }
+
+    Write-Log -Message "All $($signResult.Total) file(s) signed successfully."
 }
-
-## Check for prerequesites
-Test-Prerequisites 
-
-## Initialise variables
-$variables = Get-ScriptVariables -RequireADCSCertificate:$RequireADCSCertificate -UsePersonalCertificate:$UsePersonalCertificate -ConfigFilePath $ConfigFilePath -validityLength $CertificateValidity -certTemplate $CodeSigningTemplate -companyName $CompanyName -keyLength $KeyLength -timestampServer $TimestampingAuthority
-
-## Check/generate code signing cert
-$codeSigningCert = Get-ExistingCodeSigningCert -CertificateStore $variables.CertificateStore
-if (-not $codeSigningCert) {
-    $codeSigningCert = New-CodesigningCert -CertStore $variables.CertificateStore -ADCSRequired:$variables.RequireADCSCertificate -CompanyName $variables.CompanyName -KeyLength $variables.KeyLength -ValidityLength $variables.ValidityLength -CertTemplate $variables.CertTemplate
+catch {
+    Write-Log -Message "Unhandled error: $($_.Exception.Message)" -Level CRITICAL
 }
-
-if (-not $codeSigningCert) {
-    Write-Warning "No usable code signing certificate available (request may be pending CA approval). Exiting."
-    exit 1
-}
-
-## Find files to be signed
-$filesToSign = Get-FileToSign -Path $Path
-
-if (-not $filesToSign) {
-    Write-Warning "No files chosen to sign - exiting"
-    exit 1
-}
-
-## Sign files
-$signResult = Set-FileSignature -FileList $filesToSign -SigningCertificate $codeSigningCert -TimestampServer $variables.timestampServer
-
-if ($signResult.Failed) {
-    Write-Warning "$($signResult.Failed.Count) of $($signResult.Total) file(s) failed to sign."
-    exit 1
-}
-
-Write-Verbose "All $($signResult.Total) file(s) signed successfully."
