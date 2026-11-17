@@ -11,11 +11,13 @@ Signs one or more files with a code signing certificate, obtaining that certific
 - Signs one file via `-Path`, or opens an interactive, multi-select file picker filtered to PowerShell-signable and general Authenticode-signable file types.
 - Optional RFC 3161 timestamping, so signatures remain valid after the signing certificate itself expires.
 - Centrally governed settings via an optional JSON config file, where config values always override command-line parameters, intended for IT-controlled deployment to developer machines.
+- Optional update check and anonymous usage telemetry, each with its own opt-out.
 
 ## Requirements
 
 - Windows PowerShell 5.1 or PowerShell 7+, on Windows only (this script relies on the Windows certificate store, `certutil`, and WinForms, none of which exist on other platforms).
 - The `PKI` module, which ships with the AD CS Remote Server Administration Tools feature (Windows 8.1 / Server 2012 R2 and later). The script checks for this and provides guidance if it's missing, rather than attempting to install anything.
+- Outbound HTTPS to `pickering.cloud` for the optional update check and telemetry. Both can be disabled, see [Update check and telemetry](#update-check-and-telemetry).
 - **PowerShell must be running in STA mode for the interactive file picker.** Windows PowerShell 5.1 defaults to STA. PowerShell 7+ defaults to MTA and needs to be started with `pwsh.exe -STA`. This only matters if `-Path` is omitted.
 
 ## Usage
@@ -70,6 +72,8 @@ Always taken from the command line, never overridden by config.
 | `Path` | `string` | none | Path to a single file to sign. If omitted, the interactive file picker is shown instead. |
 | `ConfigFilePath` | `string` | `SignFileConfig.json` alongside the script | Path to the JSON config file. |
 | `BuildConfig` | `switch` | `off` | Writes a template config file to `-ConfigFilePath` using the script's current parameter values, then exits without signing anything. Always overwrites any existing file at that path. |
+| `DisableUpdateCheck` | `switch` | `off` | Do not check for a newer version. |
+| `DisableTelemetry` | `switch` | `off` | Do not send anonymous usage telemetry. The update check still runs unless `-DisableUpdateCheck` is also used. |
 
 ## Configuration file
 
@@ -78,7 +82,7 @@ Settings marked as policy-governed can be centrally controlled via a JSON config
 Generate a starting template with:
 
 ```powershell
-.\FileSigning.ps1 -BuildConfig -ConfigFilePath .SignFileConfig.json
+.\FileSigning.ps1 -BuildConfig -ConfigFilePath .\SignFileConfig.json
 ```
 
 Example schema, see [`SignFileConfig.example.json`](./SignFileConfig.example.json):
@@ -106,21 +110,30 @@ A `null` value for any setting means "no policy set", the command-line value or 
 
 ## Certificate acquisition order
 
-1. **Existing valid certificate** in the configured store (`Cert:LocalMachineMy` by default), matched on code signing Enhanced Key Usage, private key availability, and remaining validity.
+1. **Existing valid certificate** in the configured store (`Cert:\LocalMachine\My` by default), matched on code signing Enhanced Key Usage, private key availability, and remaining validity.
 
 2. **ADCS**, if no valid existing certificate is found. Availability is checked first; a `Pending` result is persisted to `pending-request-state.json` for retrieval on a later run.
 
 3. **Self-signed fallback**, if ADCS is unavailable or the request fails, unless `-RequireADCSCertificate` is set.
 
+## Update check and telemetry
+
+When the script finishes, it does two optional things. Neither can affect signing or the exit code, and any failure is ignored.
+
+**Update check.** The script reads a small static file (`https://pickering.cloud/tools/versions.json`) and tells you if a newer version is available. It sends no data. In an interactive session it offers to open the release page, and in an unattended run it only writes a line to the log. It never downloads or installs anything. Disable it with `-DisableUpdateCheck`.
+
+**Anonymous usage telemetry.** So the author can see roughly how many installs exist and which platforms to support, the script sends: tool name, tool version, OS name and build, PowerShell version and edition, timezone ID, and whether the run was interactive or unattended. The server adds the country from the request and a hash of the IP address that changes daily and cannot be linked across days. The raw IP address and User-Agent are never stored. File names, certificate details, host names and user names are never sent. Disable it with `-DisableTelemetry`, or for every tool at once by setting the environment variable `PICKERINGCLOUD_NOTELEMETRY=1` (organisations can set this centrally, for example through Group Policy).
+
+The two are independent. You can keep update checks and turn telemetry off. Run with `-Verbose` to see the exact telemetry payload in the log. See `TELEMETRY.md` in the repository root for the full policy.
+
 ## Exit codes
 
 | Code | Meaning |
-
 |---|---|
-
 | `0` | Success (files signed, or config file generated via `-BuildConfig`). |
-
 | `1` | No usable certificate available, no files selected, or one or more files failed to sign. |
+
+The update check and telemetry never change the exit code.
 
 ## Known limitations
 

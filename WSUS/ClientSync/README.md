@@ -33,6 +33,12 @@ Designed to run unattended, including via PowerShell remoting across many machin
 # Use a custom log file location
 .\WSUS-ClientSync.ps1 -CustomLogPath D:\Logs\wsus.log
 
+# Preview what remediation would do, without changing anything
+.\WSUS-ClientSync.ps1 -AutomaticallyRemediate -WhatIf
+
+# Skip the update check and telemetry
+.\WSUS-ClientSync.ps1 -DisableUpdateCheck -DisableTelemetry
+
 # Run across many machines via remoting (logging level defaults to Info automatically
 # in a remote session, since the interactive prompt cannot be shown)
 Invoke-Command -ComputerName $computers -FilePath .\WSUS-ClientSync.ps1 -ArgumentList $true
@@ -43,7 +49,11 @@ Invoke-Command -ComputerName $computers -FilePath .\WSUS-ClientSync.ps1 -Argumen
 | Parameter | Type | Default | Description |
 |:---|:---:|:---|:---|
 | `AutomaticallyRemediate` | `switch` | `off` | Attempts automatic fixes for recognised issues rather than only reporting them. |
-| `CustomLogPath` | `string` | `C:\tmp\WSUS\WSUS-ClientSync.log` | Path to the log file. |
+| `CustomLogPath` | `string` | `C:\Pickering-Cloud\Logs\WSUS-Client\WSUS-ClientSync.log` | Path to the log file. |
+| `DisableUpdateCheck` | `switch` | `off` | Skips the check for a newer version. |
+| `DisableTelemetry` | `switch` | `off` | Stops anonymous usage telemetry being sent. |
+
+The script also supports `-WhatIf` and `-Confirm`. With `-WhatIf`, nothing on the machine is changed, no synchronisation is triggered, and no telemetry is sent.
 
 ## Logging level
 
@@ -54,6 +64,29 @@ To skip the prompt entirely for unattended/scheduled use, edit the default direc
 ```powershell
 [Nullable[int]]$loggingLevel = 3  # Info
 ```
+
+## Exit codes
+
+| Code | Meaning |
+|:---:|:---|
+| 0 | The script ran to completion. This includes runs where synchronisation failed, so check the event log (events 1007, 1008 and 1016) rather than the exit code to detect a failed sync. |
+| 1 | A critical configuration or connectivity problem stopped the run (events 1002 to 1005). |
+
+## Update check and telemetry
+
+When the script finishes it can check for a newer version and send anonymous usage data. Both are optional and independent of each other, and neither can change the outcome of the run.
+
+**Update check.** A plain GET request to `https://pickering.cloud/tools/versions.json` with a generic user agent. Nothing is sent. If a newer version exists the script writes a notice to the log. In an interactive session it also offers to open the release page (GitHub links only). In a remote or unattended session, or with `-WhatIf`, it never prompts. It never downloads or installs anything.
+
+**Telemetry.** A single anonymous POST to `https://pickering.cloud/api/telemetry` containing the tool name and version, OS name and build, PowerShell version and edition, timezone ID and whether the run was interactive or unattended. The server also records the country (taken from the request) and a daily salted hash of the IP address, so repeat use can be counted without storing the address. No WSUS server names, machine names, update titles or error details are ever sent. Run the script with `-Verbose` to see the exact payload. The full disclosure is in `TELEMETRY.md` in the repository root.
+
+If you run the script across many machines, each machine makes its own request. Machines without internet access simply skip both (each attempt times out after five seconds and is logged at Info level). To opt out:
+
+| Method | Effect |
+|:---|:---|
+| `-DisableUpdateCheck` | No version check |
+| `-DisableTelemetry` | No telemetry |
+| `PICKERINGCLOUD_NOTELEMETRY=1` (or `true`) | No telemetry in any tool in this toolkit, for every user of the machine if set system-wide |
 
 ## Event Log reference
 

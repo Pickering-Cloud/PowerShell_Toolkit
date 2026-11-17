@@ -72,6 +72,16 @@
         set), then exits immediately without checking for or signing any files.
         Always overwrites any existing file at that path.
 
+    .PARAMETER DisableUpdateCheck
+        If set, the script does not check for a newer version. No network request
+        is made for this purpose.
+
+    .PARAMETER DisableTelemetry
+        If set, anonymous usage telemetry is not sent. The update check still runs
+        unless -DisableUpdateCheck is also set. Telemetry can also be disabled for
+        every tool at once by setting the environment variable
+        PICKERINGCLOUD_NOTELEMETRY to 1, for example via Group Policy.
+
     .EXAMPLE
         .\FileSigning.ps1 -Path .\Deploy-Server.ps1
 
@@ -108,6 +118,13 @@
         Windows 8.1 / Server 2012 R2 and later)
         Requires: PowerShell running in STA mode if the interactive file picker is
         used (default for Windows PowerShell 5.1; PowerShell 7+ needs 'pwsh.exe -STA')
+
+        Update check and telemetry: after the run, the script reads a static version
+        file from pickering.cloud and tells you if a newer version exists. It never
+        downloads or installs anything. Unless disabled, it also sends anonymous usage
+        data (tool, version, OS, PowerShell version, timezone, run mode). No file
+        names, certificate details or host details are sent. See TELEMETRY.md in the
+        repository root for the full list.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -142,7 +159,13 @@ param (
     [string]$TimestampingAuthority,
 
     [Parameter()]
-    [switch]$BuildConfig
+    [switch]$BuildConfig,
+
+    [Parameter()]
+    [switch]$DisableUpdateCheck,
+
+    [Parameter()]
+    [switch]$DisableTelemetry
 )
 
 ##################################################
@@ -151,6 +174,12 @@ param (
 
 $date = Get-Date -Format "yyyyMMdd"
 $logPath = "C:\Pickering-Cloud\Logs\FileSigning\$($date).log"
+
+$ScriptName = 'FileSigning'
+$ScriptVersion = '1.1.0'
+$UpdateCheckUrl = 'https://pickering.cloud/tools/versions.json'
+$TelemetryUrl = 'https://pickering.cloud/api/telemetry'
+$NetworkUserAgent = 'PickeringCloud-Toolkit'
 
 function Configure-LogPath {
     $logDir = Split-Path -Path $logPath -Parent
@@ -188,7 +217,7 @@ function Write-Log {
     $prefix = "[$Level]"
 
     if (Configure-LogPath) {
-        $time = Get-Date -Format "HH:mm:SS.zzz"
+        $time = Get-Date -Format "HH:mm:ss.zzz"
         $entry = "$time | $prefix | $Message"
         Add-Content -Value $entry -Path $logPath
     }
@@ -750,6 +779,7 @@ function Get-FileToSign {
     }
     Write-Log -Message "$($dialog.FileNames.Count) file(s) selected."
     return $dialog.FileNames
+}
 
 # Sign file(s)
 function Set-FileSignature {
@@ -818,6 +848,277 @@ function Set-FileSignature {
         Succeeded = $fileList.Count - $failures.Count
         Failed    = $failures
     }
+}
+
+#############################################################################################
+
+# Update check and telemetry
+## Both run after the script's own work, are optional, and can never affect its result.
+## Every failure is logged and ignored. Nothing is downloaded or installed.
+
+function Get-RunMode {
+    <#
+    .SYNOPSIS
+        Reports whether the script is running interactively or unattended.
+    .DESCRIPTION
+        Returns 'unattended' if the session is not user-interactive, was started with
+        -NonInteractive, or has redirected input (for example a Scheduled Task).
+        Otherwise returns 'interactive'. The PowerShell ISE and the Visual Studio Code
+        terminal are always treated as interactive.
+    .EXAMPLE
+        Get-RunMode
+
+        Returns 'interactive' when run from a normal console window.
+    .OUTPUTS
+        System.String
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    if (-not [Environment]::UserInteractive) {
+        return 'unattended'
+    }
+
+    if (@([Environment]::GetCommandLineArgs() | Where-Object { $_ -match '^-NonI' }).Count -gt 0) {
+        return 'unattended'
+    }
+
+    if ($Host.Name -like '*ISE*' -or $Host.Name -like '*Visual Studio Code*') {
+        return 'interactive'
+    }
+
+    try {
+        if ([Console]::IsInputRedirected) {
+            return 'unattended'
+        }
+    }
+    catch {
+        return 'unattended'
+    }
+
+    return 'interactive'
+}
+
+function Limit-Text {
+    <#
+    .SYNOPSIS
+        Removes control characters from a string and truncates it to a maximum length.
+    .DESCRIPTION
+        Used to keep telemetry values within the lengths the server accepts.
+    .PARAMETER Text
+        The text to clean.
+    .PARAMETER Max
+        The maximum number of characters to keep.
+    .EXAMPLE
+        Limit-Text -Text 'GMT Standard Time' -Max 64
+
+        Returns the text unchanged, as it is within the limit.
+    .OUTPUTS
+        System.String
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text,
+        [Parameter(Mandatory)]
+        [int]$Max
+    )
+
+    $clean = ($Text -replace '[\x00-\x1F\x7F]', '').Trim()
+    if ($clean.Length -gt $Max) {
+        $clean = $clean.Substring(0, $Max)
+    }
+    return $clean
+}
+
+function Get-LatestToolVersion {
+    <#
+    .SYNOPSIS
+        Reads the latest published version of this tool from the static version file.
+    .DESCRIPTION
+        Makes a plain GET request with a generic User-Agent and sends no data. Returns
+        $null if the check fails for any reason, including no network access.
+    .EXAMPLE
+        Get-LatestToolVersion
+
+        Returns an object with Version, Released, Url and Newer properties, or $null.
+    .OUTPUTS
+        System.Management.Automation.PSCustomObject, or $null.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $response = Invoke-RestMethod -Uri $UpdateCheckUrl -Method Get -TimeoutSec 5 -UserAgent $NetworkUserAgent -ErrorAction Stop
+        $entry = $response.tools.$ScriptName
+
+        if (-not $entry) {
+            Write-Log -Message "Update check: $ScriptName is not listed in the version file." -Level INFO
+            return $null
+        }
+
+        $latest = [version](([string]$entry.version -split '-')[0])
+        $current = [version](($ScriptVersion -split '-')[0])
+
+        return [pscustomobject]@{
+            Version  = [string]$entry.version
+            Released = [string]$entry.released
+            Url      = [string]$entry.url
+            Newer    = ($latest -gt $current)
+        }
+    }
+    catch {
+        Write-Log -Message "Update check failed: $($_.Exception.Message)" -Level INFO
+        return $null
+    }
+}
+
+function Show-UpdateNotice {
+    <#
+    .SYNOPSIS
+        Tells the user a newer version exists and, in an interactive session only, offers to open the release page.
+    .DESCRIPTION
+        Always writes the notice to the log. In an interactive session, also prints it to
+        the console and asks whether to open the release page. Never prompts in an
+        unattended session or during a -WhatIf run. Only github.com addresses are opened.
+    .PARAMETER Latest
+        The object returned by Get-LatestToolVersion.
+    .EXAMPLE
+        Show-UpdateNotice -Latest $latest
+
+        Reports that a newer version is available.
+    .OUTPUTS
+        None.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [pscustomobject]$Latest
+    )
+
+    $message = "Update available: $ScriptName $($Latest.Version) (you have $ScriptVersion). Release page: $($Latest.Url)"
+    Write-Log -Message $message -Level INFO
+
+    if ((Get-RunMode) -ne 'interactive' -or $WhatIfPreference) {
+        return
+    }
+
+    Write-Host $message -ForegroundColor Cyan
+    $answer = Read-Host 'Open the release page in your browser now? (y/N)'
+
+    if ($answer.Trim().ToLower() -in 'y', 'yes') {
+        # Only open GitHub links, in case the version file were ever tampered with.
+        if ($Latest.Url -match '^https://github\.com/') {
+            Start-Process -FilePath $Latest.Url
+        }
+        else {
+            Write-Log -Message "Not opening $($Latest.Url): it is not a github.com address." -Level WARN
+        }
+    }
+}
+
+function Send-ToolTelemetry {
+    <#
+    .SYNOPSIS
+        Sends anonymous usage telemetry.
+    .DESCRIPTION
+        Sends tool name, tool version, OS caption and build, PowerShell version and
+        edition, timezone ID and run mode. The server adds the country from the request
+        and a daily salted hash of the IP address. No file names, certificate details,
+        host names or user names are ever included. See TELEMETRY.md in the repository
+        root. Does nothing during a -WhatIf run.
+    .EXAMPLE
+        Send-ToolTelemetry
+
+        Sends the anonymous usage record for this run.
+    .OUTPUTS
+        None.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    try {
+        try {
+            $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+            $osCaption = [string]$osInfo.Caption
+            $osBuild = [string]$osInfo.BuildNumber
+        }
+        catch {
+            $osCaption = [Environment]::OSVersion.VersionString
+            $osBuild = [string][Environment]::OSVersion.Version.Build
+        }
+
+        $payload = [ordered]@{
+            tool      = $ScriptName
+            version   = $ScriptVersion
+            os        = Limit-Text -Text $osCaption -Max 64
+            osBuild   = Limit-Text -Text $osBuild -Max 32
+            psVersion = Limit-Text -Text $PSVersionTable.PSVersion.ToString() -Max 32
+            psEdition = if ($PSVersionTable.PSEdition -eq 'Core') { 'Core' } else { 'Desktop' }
+            timezone  = Limit-Text -Text ([TimeZoneInfo]::Local.Id) -Max 64
+            runMode   = Get-RunMode
+        }
+
+        $json = $payload | ConvertTo-Json -Compress
+        Write-Log -Message "Telemetry payload: $json" -Level INFO
+
+        if ($PSCmdlet.ShouldProcess($TelemetryUrl, 'Send anonymous usage telemetry')) {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+            Invoke-RestMethod -Uri $TelemetryUrl -Method Post -Body $bytes -ContentType 'application/json' -TimeoutSec 5 -UserAgent $NetworkUserAgent -ErrorAction Stop | Out-Null
+            Write-Log -Message 'Telemetry sent.' -Level INFO
+        }
+    }
+    catch {
+        Write-Log -Message "Telemetry not sent: $($_.Exception.Message)" -Level INFO
+    }
+}
+
+function Invoke-UpdateCheckAndTelemetry {
+    <#
+    .SYNOPSIS
+        Runs the optional update check and telemetry, honouring the opt-out switches.
+    .DESCRIPTION
+        Skips the update check if -DisableUpdateCheck was used. Skips telemetry if
+        -DisableTelemetry was used or the environment variable
+        PICKERINGCLOUD_NOTELEMETRY is 1 or true. The two are independent.
+    .EXAMPLE
+        Invoke-UpdateCheckAndTelemetry
+
+        Checks for a newer version and sends telemetry, unless disabled.
+    .OUTPUTS
+        None.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($DisableUpdateCheck) {
+        Write-Log -Message 'Update check disabled.' -Level INFO
+    }
+    else {
+        $latest = Get-LatestToolVersion
+        if ($latest -and $latest.Newer) {
+            Show-UpdateNotice -Latest $latest
+        }
+        elseif ($latest) {
+            Write-Log -Message "Update check: $ScriptName $ScriptVersion is the latest version." -Level INFO
+        }
+    }
+
+    $telemetryOff = $DisableTelemetry -or ($env:PICKERINGCLOUD_NOTELEMETRY -in '1', 'true')
+    if ($telemetryOff) {
+        Write-Log -Message 'Telemetry disabled.' -Level INFO
+    }
+    else {
+        Write-Log -Message 'Anonymous usage telemetry is on. Disable it with -DisableTelemetry or PICKERINGCLOUD_NOTELEMETRY=1. See TELEMETRY.md in the repository root.' -Level INFO
+        Send-ToolTelemetry
+    }
+}
 
 #############################################################################################
 
@@ -867,4 +1168,13 @@ try {
 }
 catch {
     Write-Log -Message "Unhandled error: $($_.Exception.Message)" -Level CRITICAL
+}
+finally {
+    # Runs on every exit path, including Write-Log -Level CRITICAL, which exits the script.
+    try {
+        Invoke-UpdateCheckAndTelemetry
+    }
+    catch {
+        Write-Log -Message "Update check or telemetry error: $($_.Exception.Message)" -Level INFO
+    }
 }
