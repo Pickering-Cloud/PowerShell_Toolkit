@@ -1,6 +1,0 @@
-﻿@{
-    TenantId            = ""
-    ClientId            = ""
-    ClientThumbprint    = ""
-}
-            
