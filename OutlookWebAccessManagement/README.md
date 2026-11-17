@@ -1,147 +1,92 @@
-# Manage-OWA
+# OWA Management for F1-Licensed Users
 
-Blocks Outlook client access (Outlook on the web, mobile and desktop clients) for Microsoft 365 users whose licensing does not entitle them to an Exchange Online mailbox, and restores access automatically when their licensing changes.
-
-Designed to run unattended, for example as a nightly scheduled task, using a certificate-authenticated service principal.
-
-## Why this exists
-
-Microsoft 365 F1 and Office 365 F1 licences do not include rights to an Exchange Online mailbox. A mailbox can still exist for these users, and nothing stops them signing in to Outlook on the web. This script finds those users, and any other mailbox holder with no licence that grants Exchange, and switches off their Outlook client access so that the tenant stays within its licence terms.
+A PowerShell script that queries an Entra tenant for users holding an F1 licence (Microsoft 365 F1 or Office 365 F1), plus mailboxes with no licence that legitimately grants Exchange access, and blocks their Outlook client access accordingly. Tracks currently blocked users so access can be restored automatically once a licence changes.
 
 ## What it does
 
-1. Connects to Microsoft Graph and Exchange Online using the configured service principal and certificate.
-2. Reads the tenant's subscribed SKUs, users and mailboxes.
-3. Builds a list of users to block:
-   - **F1 Licence**: users assigned `SPE_F1` or `DESKLESSPACK`.
-   - **No qualifying mailbox licence**: mailbox holders whose assigned licences do not include any SKU in the mailbox-granting list (see [Configuration](#configuration)).
-4. Compares that list with the saved state from the previous run:
-   - Users newly in scope are blocked.
-   - Users who were blocked but are no longer in scope (for example after a licence upgrade) are unblocked.
-   - A failed unblock is kept in the state and retried on the next run.
-5. Appends every block and unblock to a dated CSV report and saves the new state file.
-6. Disconnects from both services.
+- Connects to Microsoft Graph and Exchange Online using a certificate-based service principal (no interactive sign-in required for normal runs).
+- Identifies users licensed with F1 (`SPE_F1` / `DESKLESSPACK`) - these licences do not grant a mailbox, so any Outlook client access on an F1 mailbox needs to be blocked to stay licence-compliant.
+- Identifies mailboxes belonging to users with no licence that grants a mailbox at all (an "orphaned" mailbox - typically left over after a licence change).
+- Blocks all five OWA-family client access settings for identified users: Outlook on the web, Outlook on the web for devices, Outlook Mobile, Outlook for Mac, and the new Outlook for Windows.
+- Automatically restores access for anyone previously blocked who no longer meets either condition (e.g. their licence was upgraded).
+- Maintains a persistent state file of currently blocked users, a dated CSV audit report of every block/unblock action, and a dated log file of the full run.
 
-Blocking sets the following `Set-CASMailbox` parameters to `$false`: `OWAEnabled`, `OWAforDevicesEnabled`, `OutlookMobileEnabled`, `MacOutlookEnabled` and `OneWinNativeOutlookEnabled`.
+## Prerequisites
 
-## Requirements
+- PowerShell 5.1 or PowerShell 7+
+- PowerShell modules: `Microsoft.Graph.Authentication`, `Microsoft.Graph.Users`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.Applications`, `ExchangeOnlineManagement` (installed automatically on first run if missing)
+- For first-time setup only: an Entra account with **Application Administrator** (or **Global Administrator**) and **Privileged Role Administrator** rights
+- For unattended runs: the service principal created during setup needs the **Exchange Administrator** Entra directory role, and admin consent granted on its Graph application permissions
 
-| Requirement | Detail |
-| --- | --- |
-| PowerShell | Windows PowerShell 5.1 or PowerShell 7 |
-| Modules | `Microsoft.Graph.Authentication`, `Microsoft.Graph.Users`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.Applications`, `ExchangeOnlineManagement` |
-| Setup rights (one-off) | Application Administrator (or Global Administrator) and Privileged Role Administrator in Entra |
-| Service principal | Graph application permissions `User.Read.All` and `Organization.Read.All`, Exchange Online application permission `Exchange.ManageAsApp`, and the Exchange Administrator directory role |
-| Certificate | Self-signed certificate in the certificate store of the account running the script (created by `-Setup`) |
+## First-time setup
 
-Missing modules are installed for the current user automatically. The account running the script therefore needs access to the PowerShell Gallery on first run, or the modules must be installed beforehand.
-
-## Quick start
-
-1. Run the script once. It creates a blank `config.psd1` next to where you ran it and exits.
-
+1. Clone this repository.
+2. (Optional) If you already know your tenant ID, add it to `config.psd1` before running setup - this pins the interactive sign-in to the correct tenant if you have access to more than one.
+3. Run:
    ```powershell
-   .\Manage-OWA.ps1
+   .\OWA_Management.ps1 -Setup
    ```
+4. Sign in interactively when prompted, using an account with the rights listed above.
+5. In the Entra portal, confirm **admin consent** has been granted for the application's Graph permissions (`User.Read.All`, `Organization.Read.All`) - this step is not automated.
+6. Certificate trust and the Exchange Administrator role assignment can take a few minutes to propagate. If the first run fails to connect to Exchange Online immediately after setup, wait a few minutes and try again.
+7. From this point on, run the script normally (see below) - `-Setup` doesn't need to be passed again unless the service principal is removed or the config is cleared.
 
-2. Run the interactive setup as an administrator holding the rights above. This creates the app registration, certificate, permissions and role assignment, and writes the values into `config.psd1`.
+## Usage
 
-   ```powershell
-   .\Manage-OWA.ps1 -Setup
-   ```
+```powershell
+# Normal run - queries the tenant and blocks/unblocks as needed
+.\OWA_Management.ps1
 
-3. In the Entra admin centre, open the new app registration (`OWA-Manage-F1-Automation` by default) and grant admin consent for its application permissions.
-4. Wait a few minutes. Certificate trust and role assignment take time to propagate, and the first Exchange Online connection can fail until they do.
-5. Run the script again without `-Setup` to confirm a normal run completes.
-6. Schedule it (see [Scheduling](#scheduling)).
+# First-time or re-provisioning run
+.\OWA_Management.ps1 -Setup
+```
 
-## Parameters
-
-| Parameter | Description |
-| --- | --- |
-| `-Setup` | Runs the interactive service principal creation if none is configured. Not needed on normal runs. |
-| `-DisableUpdateCheck` | Skips the check for a newer version. |
-| `-DisableTelemetry` | Stops anonymous usage telemetry being sent. |
+Intended to be run on a schedule (Task Scheduler, Azure Automation, etc.) once set up.
 
 ## Configuration
 
-`config.psd1` is read from the current working directory and holds three values:
+`config.psd1`, alongside the script (**not committed to source control** - see `.gitignore`):
 
 ```powershell
 @{
-    TenantId         = ""
-    ClientId         = ""
-    ClientThumbprint = ""
+    TenantId            = ""
+    ClientId            = ""
+    ClientThumbprint    = ""
 }
 ```
 
-`-Setup` fills these in for you. If you configure a service principal by hand, enter your own values.
+Created automatically with blank values if missing. Populated automatically by `-Setup`.
 
-The mailbox-granting SKU list is held in `$mailboxGrantingSkuParts` near the top of the script. A SKU is matched if its part number contains any entry in the list. Review it against the SKUs your tenant actually holds before the first live run, because a user holding only a SKU that is not on the list is treated as having no mailbox licence and is blocked.
+## Output locations
 
-## Output
+| What | Where |
+|---|---|
+| Log (per run day) | `C:\Pickering-Cloud\Logs\OWAManagement\yyyyMMdd.log` |
+| CSV audit report (per run day) | `C:\Pickering-Cloud\Reports\OWAManagement\yyyyMMdd.csv` |
+| Current block state | `C:\Pickering-Cloud\Reports\OWAManagement\BlockedUsers.psd1` |
 
-| Item | Default location |
-| --- | --- |
-| Log file | `C:\Pickering-Cloud\Logs\OWAManagement\yyyyMMdd.log` |
-| Report | `C:\Pickering-Cloud\Reports\OWAManagement\yyyyMMdd.csv` |
-| State file | `C:\Pickering-Cloud\Reports\OWAManagement\BlockedUsers.psd1` |
+## How target users are identified
 
-The report records the user principal name, display name, action (`Blocked` or `Unblocked`) and reason. The state file lists currently blocked users with the date they were blocked and why. Do not delete it: it is how the script knows whom to unblock later.
+- **F1 licence holders** - any user with `SPE_F1` (Microsoft 365 F1) or `DESKLESSPACK` (Office 365 F1) in their assigned licences.
+- **Orphaned mailboxes** - any user with a mailbox but no licence matching the `$mailboxGrantingSkuParts` list in the script. This list deliberately excludes F1 SKUs, since F1 doesn't grant a mailbox in the first place.
 
-## Exit codes
+Verify `$mailboxGrantingSkuParts` against your own tenant's SKUs (`Get-MgSubscribedSku | Select SkuPartNumber`) before relying on this in production - the shipped list covers common Business/Enterprise/Education plans but not every possible SKU.
 
-| Code | Meaning |
-| --- | --- |
-| 0 | Run completed, or a default `config.psd1` was created |
-| 1 | A critical error stopped the run (for example missing configuration or a failed connection) |
+## Service principal permissions
 
-## Scheduling
+| Permission | Type | Purpose |
+|---|---|---|
+| `User.Read.All` | Graph, Application | Read users and their assigned licences |
+| `Organization.Read.All` | Graph, Application | Read subscribed SKUs and tenant domain |
+| `Exchange.ManageAsApp` | Exchange Online, Application | Authenticate to Exchange Online as an app |
+| Exchange Administrator | Entra directory role | Actually authorised to run `Set-CASMailbox` |
 
-Run the script from a scheduled task under the account that holds the certificate, with the working directory set to the folder containing `config.psd1`.
+## Known limitations
 
-```powershell
-$action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
-    -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\Scripts\Manage-OWA\Manage-OWA.ps1"' `
-    -WorkingDirectory 'C:\Scripts\Manage-OWA'
-$trigger = New-ScheduledTaskTrigger -Daily -At 02:00
-Register-ScheduledTask -TaskName 'Manage-OWA' -Action $action -Trigger $trigger -RunLevel Highest
-```
+- `OneWinNativeOutlookEnabled` requires a reasonably recent `ExchangeOnlineManagement` module version and may not exist in older installs - remove it from `$owaClientParameters` if you hit a "parameter not found" error.
+- `Write-Progress` output only appears in an interactive console session; it's silently discarded when run as an unattended scheduled task.
+- Module installation uses the default (`AllUsers`) scope, which typically requires an elevated session.
 
-Set the task to run as the account whose certificate store holds the service principal certificate.
+## Author
 
-## Update check and telemetry
-
-After each run the script can check for a newer version and send anonymous usage data. Both are optional and independent of each other, and neither can change the outcome of the run.
-
-**Update check.** A plain GET request to `https://pickering.cloud/tools/versions.json` with a generic user agent. Nothing is sent. If a newer version exists the script tells you and writes the notice to the log. In an interactive session it also offers to open the release page (GitHub links only). In an unattended session it never prompts. It never downloads or installs anything.
-
-**Telemetry.** A single anonymous POST to `https://pickering.cloud/api/telemetry` containing the tool name and version, OS name and build, PowerShell version and edition, timezone ID and whether the run was interactive or unattended. The server also records the country (taken from the request) and a daily salted hash of the IP address, so repeat use can be counted without storing the address. No tenant ID, user, mailbox or licence information is ever sent. Run the script with `-Verbose` to see the exact payload. The full disclosure is in `TELEMETRY.md` in the repository root.
-
-To opt out:
-
-| Method | Effect |
-| --- | --- |
-| `-DisableUpdateCheck` | No version check |
-| `-DisableTelemetry` | No telemetry |
-| `PICKERINGCLOUD_NOTELEMETRY=1` (or `true`) | No telemetry in any tool in this toolkit, for every user of the machine if set system-wide |
-
-## Safety notes
-
-- The script changes mailbox settings for real. There is no `-WhatIf` mode in this version, so test against a small tenant or review the SKU list and your F1 population first.
-- Blocking affects Outlook on the web, mobile and desktop clients. It does not remove the mailbox, and mail continues to be delivered.
-- The service principal holds the Exchange Administrator role. Protect the certificate's private key and restrict who can read the scheduled task account's certificate store.
-
-## Troubleshooting
-
-| Symptom | Likely cause |
-| --- | --- |
-| Exchange Online connection fails straight after `-Setup` | Role and certificate propagation delay. Wait several minutes and run again. |
-| "Service principal not configured" | `config.psd1` is empty, or the script was started from a different working directory. |
-| Everyone is reported as having no qualifying licence | The tenant uses a SKU that is not in `$mailboxGrantingSkuParts`. |
-| "No F1 SKU found in tenant" | No `SPE_F1` or `DESKLESSPACK` SKU is subscribed. This is a warning, not a failure. |
-| Graph calls return 403 | Admin consent has not been granted to the application permissions. |
-
-## Licence and support
-
-Part of the [Pickering-Cloud PowerShell Toolkit](https://github.com/Pickering-Cloud/PowerShell_Toolkit). See the repository for licence terms, and the [CHANGELOG](CHANGELOG.md) for version history.
+Bradley Pickering

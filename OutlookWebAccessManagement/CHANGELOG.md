@@ -1,37 +1,62 @@
-# Changelog
+\# Changelog
 
-All notable changes to Manage-OWA are documented in this file.
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
-## [1.1.0] - 2026-11-17
+All notable changes to this project are documented in this file.
 
-### Added
 
-- Optional update check. Reads a static version file from `https://pickering.cloud/tools/versions.json` and tells you when a newer version is available. Nothing is sent, nothing is downloaded or installed, and an interactive session is only offered the chance to open the GitHub release page. Unattended runs never prompt.
-- Optional anonymous usage telemetry (tool, version, OS and build, PowerShell version and edition, timezone, run mode). No tenant, user, mailbox or licence data is sent. See `TELEMETRY.md` in the repository root.
-- `-DisableUpdateCheck` and `-DisableTelemetry` switches, which work independently of each other.
-- `PICKERINGCLOUD_NOTELEMETRY` environment variable (`1` or `true`) to disable telemetry across every tool in the toolkit.
-- `[CmdletBinding()]`, enabling `-Verbose`, which prints the exact telemetry payload.
-- `README.md` and `CHANGELOG.md`.
 
-### Changed
+The format is based on \[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to \[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-- The main script body now runs inside `try`/`finally` so the update check and telemetry run on every exit path, including CRITICAL errors.
-- Script header help documents the new parameters and the update check and telemetry behaviour.
 
-## [1.0.0] - Initial release
 
-### Added
+\## \[Unreleased]
 
-- Blocks Outlook client access (`OWAEnabled`, `OWAforDevicesEnabled`, `OutlookMobileEnabled`, `MacOutlookEnabled`, `OneWinNativeOutlookEnabled`) for users licensed with Microsoft 365 F1 or Office 365 F1.
-- Blocks mailbox holders with no licence that grants Exchange Online, using a configurable list of mailbox-granting SKU part numbers.
-- Automatically unblocks users who are no longer in scope, for example after a licence upgrade. Failed unblocks are retried on the next run.
-- Persistent state file (`BlockedUsers.psd1`) tracking currently blocked users, with the date and reason.
-- Dated CSV report of every block and unblock action.
-- Dated log file with INFO, WARN, ERROR and CRITICAL levels. CRITICAL exits with code 1.
-- `-Setup` switch for interactive, one-off service principal provisioning: certificate, app registration, Graph application permissions (`User.Read.All`, `Organization.Read.All`), `Exchange.ManageAsApp` and the Exchange Administrator directory role.
-- Certificate-based app-only authentication to Microsoft Graph and Exchange Online for unattended use.
-- `config.psd1` for tenant ID, client ID and certificate thumbprint, created automatically on first run and updated by `-Setup`.
-- Automatic installation of missing PowerShell modules for the current user.
-- Progress bars for the block and unblock passes.
+
+
+\## \[1.0.0] - 2026-08-18
+
+
+
+\### Added
+
+
+
+\- Interactive service principal setup (`-Setup`) creating an Entra app registration, self-signed authentication certificate, and required Graph/Exchange Online permissions, including the Exchange Administrator directory role.
+
+\- Human-readable `config.psd1`, auto-created with blank defaults on first run and updated automatically after setup.
+
+\- Tenant querying for users licensed with Microsoft 365 F1 or Office 365 F1 (`SPE\_F1` / `DESKLESSPACK`).
+
+\- Tenant querying for mailboxes with no licence that grants Exchange access ("orphaned" mailboxes).
+
+\- Blocking and unblocking of all five OWA-family client access settings per user: Outlook on the web, Outlook on the web for devices, Outlook Mobile, Outlook for Mac, and the new Outlook for Windows.
+
+\- Persistent state file (`BlockedUsers.psd1`) tracking currently blocked users, enabling automatic unblock when a user no longer meets either blocking condition.
+
+\- Dated CSV audit report of every block/unblock action, separate from the persistent state file.
+
+\- Dated log file with INFO/WARN/ERROR/CRITICAL levels; CRITICAL halts the script after logging.
+
+\- `Write-Progress` bars for the block and unblock passes during a run.
+
+\- Full comment-based help (`.SYNOPSIS`, `.DESCRIPTION`, `.PARAMETER`, `.EXAMPLE`, `.OUTPUTS`, `.NOTES`) on every function and the main script.
+
+
+
+\### Fixed
+
+
+
+\- Interactive sign-in during setup now pins to the known tenant ID (if already configured) rather than relying on the signed-in account's default tenant, preventing the app registration from being created in the wrong tenant.
+
+\- CRITICAL log entries now always halt the script, even if the log directory itself can't be created.
+
+\- `Get-EXOMailbox` now explicitly requests `UserPrincipalName`, since it isn't guaranteed to be present in the cmdlet's default reduced property set - omitting it previously caused every mailbox to silently fail matching against the user list.
+
+\- Single quotes in a blocked user's display name (e.g. `O'Brien`) are now escaped when writing the state file, preventing corruption of the generated `.psd1`.
+
+\- Empty result sets from the F1 and orphaned-mailbox queries are now guaranteed to be genuine empty arrays rather than `$null`, preventing a crash in the block/unblock reconciliation step on any run where one of those lists is empty.
+
+\- `$mailboxGrantingSkuParts` no longer includes `SPE\_F1` or `DESKLESSPACK` (previously matched via an overly broad `SPE\_` wildcard) - F1 licences do not grant a mailbox, so F1-only users are now correctly identified as orphaned rather than treated as adequately licensed.
+
