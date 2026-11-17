@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Audits Active Directory for stale accounts, disabled-but-privileged accounts,
     accounts nearing password expiry, and empty security groups.
