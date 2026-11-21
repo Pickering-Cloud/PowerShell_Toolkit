@@ -8,11 +8,23 @@
     .PARAMETER Setup
         Runs interactive service principal creation if one is not already configured. Requires Application Administrator (or Global Administrator) and Privileged Role Administrator rights in Entra. Not needed on normal unattended runs once the service principal exists.
 
+    .PARAMETER LogPath
+        Log file location. Defaults to C:\ProgramData\PickeringCloud\OutlookWebAccessManagement\Logs\OutlookWebAccessManagement.log. The file is appended to across runs and rotated at 10 MB.
+
+    .PARAMETER LoggingLevel
+        Debug, Verbose, Info, Warn, Error, Critical or None (1 to 7, 0 also means None). Defaults to Info. -Debug and -Verbose raise it if this is not set.
+
+    .PARAMETER ReportPath
+        Folder for the daily audit CSV and the BlockedUsers.psd1 state file. Defaults to C:\ProgramData\PickeringCloud\OutlookWebAccessManagement\Reports.
+
+    .PARAMETER RetentionDays
+        Daily audit CSVs older than this are removed. Defaults to 0 (keep them all), because the CSVs are the audit trail. The state file is never removed.
+
     .PARAMETER DisableUpdateCheck
         Skips the check for a newer version. No network request is made for this purpose.
 
     .PARAMETER DisableTelemetry
-        Stops anonymous usage telemetry being sent. The update check still runs unless -DisableUpdateCheck is also used. Telemetry can also be disabled for every tool at once by setting the environment variable PICKERINGCLOUD_NOTELEMETRY to 1, for example via Group Policy.
+        Stops anonymous usage telemetry being sent. The update check still runs unless -DisableUpdateCheck is also used. Telemetry can also be disabled for every tool at once by setting the environment variable PICKERINGCLOUD_NOTELEMETRY (or DO_NOT_TRACK) to 1, for example via Group Policy.
 
     .EXAMPLE
         .\Manage-OWA.ps1
@@ -25,10 +37,11 @@
         Runs interactive service principal setup first (if not already configured), then continues into a normal run.
 
     .OUTPUTS
-        None. Writes progress to the console and to the log file at C:\Pickering-Cloud\Logs\OWAManagement, appends blocked/unblocked actions to a dated CSV report at C:\Pickering-Cloud\Reports\OWAManagement, and maintains a persistent state file (BlockedUsers.psd1) tracking currently blocked users.
+        None. Writes progress to the console and to the log file (see -LogPath), appends blocked/unblocked actions to a daily CSV report named OutlookWebAccessManagement_yyyyMMdd.csv in -ReportPath, and maintains a persistent state file (BlockedUsers.psd1) in the same folder tracking currently blocked users. On first run after upgrading from 1.1.0, an existing state file at C:\Pickering-Cloud\Reports\OWAManagement\BlockedUsers.psd1 is copied to the new location.
 
     .NOTES
         Author: Bradley Pickering
+        Version: 1.2.0
         Requires: Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Identity.DirectoryManagement, Microsoft.Graph.Applications, ExchangeOnlineManagement modules.
         Requires: Exchange Administrator directory role assigned to the service principal, and admin consent granted on its Graph application permissions, before the first unattended run.
         Update check and telemetry: after the run, the script reads a static version file from pickering.cloud and tells you if a newer version exists. It never downloads or installs anything. Unless disabled, it also sends anonymous usage data (tool, version, OS, PowerShell version, timezone, run mode). No tenant, user, mailbox or licence details are sent. See TELEMETRY.md in the repository root for the full list.
@@ -37,12 +50,755 @@
 ##################################################
 # Script Parameters
 ##################################################
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
+    # ---- Script-specific parameters go here (each one ends with a comma) ----
     [switch]$Setup,
+
+    # ---- Standard toolkit parameters (do not remove) ----
+    [string]$LogPath,
+    [string]$LoggingLevel,
+    [string]$ReportPath,
+    [ValidateRange(0, 3650)]
+    [int]$RetentionDays,
     [switch]$DisableUpdateCheck,
     [switch]$DisableTelemetry
 )
+
+#region PC-CONFIG
+
+# Per-tool values
+$ScriptName    = 'OutlookWebAccessManagement'
+$ScriptVersion = '1.2.0'
+
+# Toolkit-wide values
+$UpdateCheckUrl        = 'https://pickering.cloud/tools/versions.json'
+$TelemetryUrl          = 'https://pickering.cloud/api/telemetry'
+$NetworkUserAgent      = 'PickeringCloud-Toolkit'
+$UpdateUrlAllowPattern = '^https://github\.com/'
+$TelemetryOptOutEnvVar = 'PICKERINGCLOUD_NOTELEMETRY'
+$TelemetryDocName      = 'TELEMETRY.md'
+$VendorFolderName      = 'PickeringCloud'
+
+# Defaults used when the matching parameter is not supplied
+$DefaultLoggingLevel  = 'Info'
+$DefaultRetentionDays = 0    # (tool override) The daily CSVs are the audit trail, so keep them unless -RetentionDays is set.
+$DefaultDataRoot      = Join-Path -Path ([Environment]::GetFolderPath('CommonApplicationData')) -ChildPath ('{0}\{1}' -f $VendorFolderName, $ScriptName)
+$DefaultLogPath       = Join-Path -Path $DefaultDataRoot -ChildPath ('Logs\{0}.log' -f $ScriptName)
+$DefaultReportPath    = Join-Path -Path $DefaultDataRoot -ChildPath 'Reports'
+
+# Log file behaviour
+$LogMaxSizeMB      = 10      # Rotate at this size. 0 disables rotation.
+$LogArchivesToKeep = 5       # Rotated copies kept (Name.1.log is the newest).
+$RedactLogSecrets  = $true   # Best-effort masking of passwords, secrets and tokens.
+
+# Windows event log
+$EventLogName   = 'Application'
+$EventLogSource = $ScriptName
+#endregion PC-CONFIG
+
+#region PC-TEMPLATE v1.1.1
+$TemplateVersion = '1.1.1'
+
+# NONE sits above Critical so that a threshold of NONE suppresses every message.
+$logLevelMap = @{
+    'DEBUG'    = 1
+    'VERBOSE'  = 2
+    'INFO'     = 3
+    'WARN'     = 4
+    'ERROR'    = 5
+    'CRITICAL' = 6
+    'NONE'     = 7
+}
+
+# ------------------------------------------------------------------------------
+# Text helpers
+# ------------------------------------------------------------------------------
+function Limit-Text {
+    <#
+    .SYNOPSIS
+        Strips control characters and trims text to a maximum length.
+    .DESCRIPTION
+        Used for anything that comes from outside the script (remote files, system
+        values) before it is logged or sent.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [string]$Text,
+        [int]$Max = 256
+    )
+
+    $clean = ($Text -replace '[\x00-\x1F\x7F]', '').Trim()
+    if ($clean.Length -gt $Max) { $clean = $clean.Substring(0, $Max) }
+    return $clean
+}
+
+function Protect-LogText {
+    <#
+    .SYNOPSIS
+        Masks common secret patterns in text before it is logged.
+    .DESCRIPTION
+        Best effort only. It catches "Bearer <token>" and key=value or key: value pairs
+        where the key looks like a password, secret, token or API key. It does not replace
+        simply never logging secrets.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([string]$Text)
+
+    if (-not $RedactLogSecrets -or [string]::IsNullOrEmpty($Text)) { return $Text }
+
+    $masked = $Text -replace '(?i)\bBearer\s+[A-Za-z0-9\-._~+/]+=*', 'Bearer ***'
+    $masked = $masked -replace '(?i)\b(password|passwd|pwd|secret|client_?secret|token|access_?token|api[_-]?key)\b(["'']?\s*[=:]\s*)("[^"]*"|''[^'']*''|\S+)', '$1$2***'
+    return $masked
+}
+
+# ------------------------------------------------------------------------------
+# Configuration checks and run mode
+# ------------------------------------------------------------------------------
+function Test-ToolConfig {
+    <#
+    .SYNOPSIS
+        Checks the CONFIG block and returns a list of problems (empty if all is well).
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    $problems = New-Object -TypeName 'System.Collections.Generic.List[string]'
+
+    if ($ScriptName -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$') {
+        $problems.Add('ScriptName must be 1 to 64 characters: letters, digits, dot, underscore or hyphen.')
+    }
+
+    $parsedVersion = $null
+    if (-not [version]::TryParse((([string]$ScriptVersion -split '-')[0]), [ref]$parsedVersion)) {
+        $problems.Add('ScriptVersion must look like 1.2.3 (an optional -suffix is allowed).')
+    }
+
+    foreach ($name in 'UpdateCheckUrl', 'TelemetryUrl') {
+        $value = [string](Get-Variable -Name $name -ValueOnly -ErrorAction SilentlyContinue)
+        if ($value -notmatch '^https://') {
+            $problems.Add(('{0} must be an https:// address.' -f $name))
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($NetworkUserAgent)) { $problems.Add('NetworkUserAgent must not be empty.') }
+    if ([string]::IsNullOrWhiteSpace($EventLogSource)) { $problems.Add('EventLogSource must not be empty.') }
+    if ($LogMaxSizeMB -lt 0 -or $LogArchivesToKeep -lt 0) { $problems.Add('LogMaxSizeMB and LogArchivesToKeep must not be negative.') }
+
+    return $problems.ToArray()
+}
+
+function Get-RunMode {
+    <#
+    .SYNOPSIS
+        Returns 'interactive' or 'unattended'.
+    .DESCRIPTION
+        Unattended means no prompt may ever be shown: no user session, -NonInteractive
+        was passed, or input is redirected. A script can set $script:RunMode itself
+        before this template runs to override the detection.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    $nonInteractiveFlag = @([Environment]::GetCommandLineArgs() | Where-Object { $_ -like '-noni*' }).Count -gt 0
+
+    if (-not [Environment]::UserInteractive -or $nonInteractiveFlag -or [Console]::IsInputRedirected) {
+        return 'unattended'
+    }
+    return 'interactive'
+}
+
+function Resolve-LogLevel {
+    <#
+    .SYNOPSIS
+        Converts a level name or number to its numeric value, or returns -1 if invalid.
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([string]$Value)
+
+    $text = $Value.Trim().ToUpper()
+
+    if ($logLevelMap.ContainsKey($text)) { return [int]$logLevelMap[$text] }
+
+    $number = 0
+    if ([int]::TryParse($text, [ref]$number) -and $number -ge 0 -and $number -le 7) {
+        if ($number -eq 0) { return [int]$logLevelMap['NONE'] }
+        return $number
+    }
+    return -1
+}
+
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
+function Invoke-LogRotation {
+    <#
+    .SYNOPSIS
+        Rotates the log file when it has grown past the size limit.
+    .DESCRIPTION
+        Name.log becomes Name.1.log, Name.1.log becomes Name.2.log, and so on. The oldest
+        copy beyond $LogArchivesToKeep is deleted.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [int]$MaxSizeMB,
+        [int]$Keep
+    )
+
+    if ($MaxSizeMB -le 0 -or $Keep -le 0) { return }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    if ((Get-Item -LiteralPath $Path).Length -lt ($MaxSizeMB * 1MB)) { return }
+
+    $folder = Split-Path -Path $Path -Parent
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    $ext = [System.IO.Path]::GetExtension($Path)
+
+    for ($i = $Keep; $i -ge 1; $i--) {
+        if ($i -eq 1) { $source = $Path }
+        else { $source = Join-Path -Path $folder -ChildPath ('{0}.{1}{2}' -f $base, ($i - 1), $ext) }
+        $target = Join-Path -Path $folder -ChildPath ('{0}.{1}{2}' -f $base, $i, $ext)
+
+        if (Test-Path -LiteralPath $source) {
+            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction Stop -WhatIf:$false }
+            Move-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop -WhatIf:$false
+        }
+    }
+}
+
+function Initialize-ToolLogging {
+    <#
+    .SYNOPSIS
+        Creates the log folder and file, rotating first if needed.
+    .DESCRIPTION
+        The file is created read-only to discourage accidental edits. Write-LogFile uses
+        -Force to write past that attribute. Failure to create the log is a failed run.
+        Logging is never gated behind WhatIf, so -WhatIf runs are logged too.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Logging is not available yet, so errors go straight to the console.')]
+    [CmdletBinding()]
+    param()
+
+    try {
+        $logFolder = Split-Path -Path $Script:LogPath -Parent
+        [void][System.IO.Directory]::CreateDirectory($logFolder)
+
+        try {
+            Invoke-LogRotation -Path $Script:LogPath -MaxSizeMB $LogMaxSizeMB -Keep $LogArchivesToKeep
+        }
+        catch {
+            Write-Host ('Log rotation failed, continuing with the current file: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+        }
+
+        if (-not (Test-Path -LiteralPath $Script:LogPath -PathType Leaf)) {
+            [System.IO.File]::Create($Script:LogPath).Dispose()
+            Set-ItemProperty -LiteralPath $Script:LogPath -Name IsReadOnly -Value $true -WhatIf:$false
+        }
+    }
+    catch {
+        Write-Host ('Unable to create the log file {0}: {1}' -f $Script:LogPath, $_.Exception.Message) -ForegroundColor Red
+        exit 1
+    }
+}
+
+function Write-LogFile {
+    <#
+    .SYNOPSIS
+        Writes a message to the log file, subject to the configured logging level.
+    .DESCRIPTION
+        Appends a timestamped, level-tagged, single-line entry. The message is only written
+        if its level is at or above $Script:LogThreshold. Secrets are masked first when
+        $RedactLogSecrets is on.
+    .PARAMETER message
+        The text to log.
+    .PARAMETER level
+        Debug, Verbose, Info, Warn, Error or Critical.
+    .EXAMPLE
+        Write-LogFile -level Info -message 'Scan completed successfully.'
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]$message,
+        [Parameter(Mandatory)]
+        [ValidateSet('Debug', 'Verbose', 'Info', 'Warn', 'Error', 'Critical')]
+        [string]$level
+    )
+
+    $levelName = $level.ToUpper()
+    if ($logLevelMap[$levelName] -ge $Script:LogThreshold) {
+        $singleLine = (Protect-LogText -Text $message) -replace '[\r\n]+', ' '
+        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+        $line = '{0} | [{1}] | {2}' -f $timestamp, $levelName, $singleLine
+        Add-Content -LiteralPath $Script:LogPath -Value $line -Encoding UTF8 -Force -ErrorAction Stop -WhatIf:$false
+    }
+}
+
+function Write-Log {
+    <#
+    .SYNOPSIS
+        Logs a message to the log file and echoes it to the console.
+    .DESCRIPTION
+        Calls Write-LogFile, then echoes the same message to the console if its level meets
+        the logging threshold. -Success only changes the console colour. The entry is still
+        logged at the level supplied. Never gated behind WhatIf: logging always runs.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Console output is intentional; the log file is the durable record.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [string]$Message,
+
+        [ValidateSet('Debug', 'Verbose', 'Info', 'Warn', 'Error', 'Critical')]
+        [string]$Level = 'Info',
+
+        [switch]$Success
+    )
+
+    $safeMessage = Protect-LogText -Text $Message
+
+    try {
+        Write-LogFile -level $Level -message $safeMessage
+    }
+    catch {
+        Write-Host ('[LOGGING FAILURE] {0}' -f $_.Exception.Message) -ForegroundColor Red
+    }
+
+    if ($logLevelMap[$Level.ToUpper()] -ge $Script:LogThreshold) {
+        $line = '[{0}] [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level.ToUpper(), $safeMessage
+
+        if ($Success) { Write-Host $line -ForegroundColor Green }
+        else {
+            switch ($Level) {
+                'Critical' { Write-Host $line -ForegroundColor Red }
+                'Error' { Write-Host $line -ForegroundColor Red }
+                'Warn' { Write-Host $line -ForegroundColor Yellow }
+                'Debug' { Write-Host $line -ForegroundColor DarkGray }
+                'Verbose' { Write-Host $line -ForegroundColor DarkGray }
+                default { Write-Host $line }
+            }
+        }
+    }
+}
+
+# ------------------------------------------------------------------------------
+# Windows event log
+# ------------------------------------------------------------------------------
+function Initialize-EventLogSource {
+    <#
+    .SYNOPSIS
+        Registers the event source if possible and records whether event writes will work.
+    .DESCRIPTION
+        Registration needs an elevated session, and the event log cmdlets do not exist in
+        PowerShell 7. Either way the scan carries on and event writes are skipped.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $Script:eventLogReady = $false
+
+    if (-not (Get-Command -Name Write-EventLog -ErrorAction SilentlyContinue)) {
+        Write-LogFile -level Debug -message 'Event log cmdlets are not available in this PowerShell edition. Event log writes are skipped.'
+        return
+    }
+
+    try {
+        if (-not [System.Diagnostics.EventLog]::SourceExists($EventLogSource)) {
+            New-EventLog -LogName $EventLogName -Source $EventLogSource -ErrorAction Stop
+        }
+        $Script:eventLogReady = $true
+    }
+    catch {
+        Write-LogFile -level Warn -message "Could not register event log source '$EventLogSource': $($_.Exception.Message). Event log writes will be skipped until this is resolved (requires an elevated session)."
+    }
+}
+
+function Write-LogEvent {
+    <#
+    .SYNOPSIS
+        Writes an entry to the Windows Application Event Log.
+    .DESCRIPTION
+        Wraps Write-EventLog under the script's registered source. Used for the subset of
+        conditions worth surfacing to central monitoring, distinct from the full file log.
+    .PARAMETER eventID
+        The event ID to log. See the tool README for the event ID map.
+    .PARAMETER entryType
+        Error, Warning, Information, SuccessAudit or FailureAudit.
+    .EXAMPLE
+        Write-LogEvent -eventID 3010 -entryType Error -message 'Entra app expiry scan failed.'
+    #>
+    [CmdletBinding()]
+    param (
+        [string]$logSource = $EventLogSource,
+        [string]$logName = $EventLogName,
+        [Parameter(Mandatory)]
+        [string]$message,
+        [Parameter(Mandatory)]
+        [int]$eventID,
+        [Parameter(Mandatory)]
+        [System.Diagnostics.EventLogEntryType]$entryType
+    )
+
+    # Event messages are capped by Windows at roughly 31,800 characters.
+    $text = Protect-LogText -Text $message
+    if ($text.Length -gt 30000) { $text = $text.Substring(0, 30000) }
+
+    Write-EventLog -LogName $logName -Source $logSource -EntryType $entryType -Category 0 -EventId $eventID -Message $text
+}
+
+function Send-LogEvent {
+    <#
+    .SYNOPSIS
+        Writes an Application event log entry if the event source is available.
+    .DESCRIPTION
+        Wraps Write-LogEvent so a missing event source never stops the scan. Failures are
+        logged as Warn.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [Parameter(Mandatory = $true)]
+        [int]$EventId,
+
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.EventLogEntryType]$EntryType
+    )
+
+    if (-not $Script:eventLogReady) {
+        Write-LogFile -level Debug -message ('Event {0} not written, event log source unavailable.' -f $EventId)
+        return
+    }
+
+    try {
+        Write-LogEvent -eventID $EventId -entryType $EntryType -message $Message
+    }
+    catch {
+        Write-LogFile -level Warn -message ('Event log write failed for event {0}: {1}' -f $EventId, $_.Exception.Message)
+    }
+}
+
+# ------------------------------------------------------------------------------
+# Report folder and retention
+# ------------------------------------------------------------------------------
+function Initialize-OutputFolder {
+    <#
+    .SYNOPSIS
+        Creates the report folder, refusing a drive root.
+    #>
+    [CmdletBinding()]
+    param()
+
+    # Folder creation is deliberately not gated: reports need somewhere to go.
+    $root = [System.IO.Path]::GetPathRoot($Script:ReportPath)
+    if ($Script:ReportPath.TrimEnd('\', '/') -eq $root.TrimEnd('\', '/')) {
+        throw ('ReportPath {0} is a drive root. Choose a subfolder.' -f $Script:ReportPath)
+    }
+
+    [void][System.IO.Directory]::CreateDirectory($Script:ReportPath)
+}
+
+function Remove-ExpiredOutput {
+    <#
+    .SYNOPSIS
+        Removes this tool's old .csv and .html reports.
+    .DESCRIPTION
+        Only files named "<ScriptName>_*" are considered, so other files in the folder are
+        never touched. Drive roots are refused.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Folder,
+
+        [Parameter(Mandatory = $true)]
+        [int]$OlderThanDays
+    )
+
+    if ($OlderThanDays -le 0) {
+        Write-Log 'Retention cleanup disabled (RetentionDays is 0).' -Level Debug
+        return
+    }
+
+    $cutoff = (Get-Date).AddDays(-$OlderThanDays)
+    $namePattern = '{0}_*' -f $ScriptName
+    $removed = 0
+
+    foreach ($path in $Folder) {
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            Write-Log 'Retention cleanup skipped: the folder path is empty.' -Level Warn
+            continue
+        }
+
+        $root = [System.IO.Path]::GetPathRoot($path)
+        if ($path.TrimEnd('\', '/') -eq $root.TrimEnd('\', '/')) {
+            Write-Log ('Retention cleanup skipped for {0}: it is a drive root.' -f $path) -Level Warn
+            continue
+        }
+
+        try {
+            $oldFiles = Get-ChildItem -LiteralPath $path -File -ErrorAction Stop |
+                Where-Object { $_.LastWriteTime -lt $cutoff -and $_.Name -like $namePattern -and $_.Extension -in '.csv', '.html' }
+
+            foreach ($file in $oldFiles) {
+                if ($PSCmdlet.ShouldProcess($file.FullName, 'Remove report past retention period')) {
+                    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                    $removed++
+                    Write-Log ('Removed old file: {0}' -f $file.FullName) -Level Debug
+                }
+            }
+        }
+        catch {
+            Write-Log ('Retention cleanup failed in {0}: {1}' -f $path, $_.Exception.Message) -Level Warn
+        }
+    }
+
+    Write-Log ('Retention cleanup complete. Reports removed: {0} (older than {1} days).' -f $removed, $OlderThanDays)
+}
+
+# ------------------------------------------------------------------------------
+# Update check and telemetry
+# Both run after the scan, are optional, and can never affect its result. Every
+# failure is logged at Debug and ignored. Nothing is downloaded or installed.
+# ------------------------------------------------------------------------------
+function Enable-ModernTls {
+    <#
+    .SYNOPSIS
+        Makes sure TLS 1.2 is allowed on Windows PowerShell 5.1. PowerShell 7 needs nothing.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+}
+
+function Get-LatestToolVersion {
+    <#
+    .SYNOPSIS
+        Reads the latest published version of this tool from the static version file.
+    .DESCRIPTION
+        Makes a plain GET request with a generic User-Agent and sends no data. Remote
+        values are cleaned before use. Returns $null if the check fails for any reason.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+
+    try {
+        Enable-ModernTls
+        $response = Invoke-RestMethod -Uri $UpdateCheckUrl -Method Get -TimeoutSec 5 -UserAgent $NetworkUserAgent -ErrorAction Stop
+        $entry = $response.tools.$ScriptName
+
+        if (-not $entry) {
+            Write-Log ('Update check: {0} is not listed in the version file.' -f $ScriptName) -Level Debug
+            return $null
+        }
+
+        $latestText = Limit-Text -Text ([string]$entry.version) -Max 32
+        $latest = [version](($latestText -split '-')[0])
+        $current = [version](($ScriptVersion -split '-')[0])
+
+        return [pscustomobject]@{
+            Version  = $latestText
+            Released = Limit-Text -Text ([string]$entry.released) -Max 32
+            Url      = Limit-Text -Text ([string]$entry.url) -Max 300
+            Newer    = ($latest -gt $current)
+        }
+    }
+    catch {
+        Write-Log ('Update check failed: {0}' -f $_.Exception.Message) -Level Debug
+        return $null
+    }
+}
+
+function Show-UpdateNotice {
+    <#
+    .SYNOPSIS
+        Tells the user a newer version exists and, in an interactive session only, offers to
+        open the release page.
+    .DESCRIPTION
+        The link is only shown and opened if it matches $UpdateUrlAllowPattern, in case the
+        version file were ever tampered with.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Latest
+    )
+
+    $urlIsSafe = $Latest.Url -match $UpdateUrlAllowPattern
+
+    if ($urlIsSafe) {
+        Write-Log ('Update available: {0} {1} (you have {2}). Release page: {3}' -f $ScriptName, $Latest.Version, $ScriptVersion, $Latest.Url)
+    }
+    else {
+        Write-Log ('Update available: {0} {1} (you have {2}). The version file gave no trusted release link, so none is shown.' -f $ScriptName, $Latest.Version, $ScriptVersion) -Level Warn
+    }
+
+    # Never prompt in unattended runs or dry runs.
+    if ($script:RunMode -ne 'interactive' -or $WhatIfPreference -or -not $urlIsSafe) {
+        return
+    }
+
+    $answer = Read-Host 'Open the release page in your browser now? (y/N)'
+    if ($answer.Trim().ToLower() -in 'y', 'yes') {
+        Start-Process -FilePath $Latest.Url
+    }
+}
+
+function Send-ToolTelemetry {
+    <#
+    .SYNOPSIS
+        Sends anonymous usage telemetry.
+    .DESCRIPTION
+        Sends tool name, tool version, OS caption and build, PowerShell version and
+        edition, timezone ID and run mode. The server adds the country from the request
+        and a daily salted hash of the IP address. No tenant, user, host or application
+        data is ever included. See TELEMETRY.md in the repository root.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    try {
+        try {
+            $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+            $osCaption = [string]$osInfo.Caption
+            $osBuild = [string]$osInfo.BuildNumber
+        }
+        catch {
+            $osCaption = [Environment]::OSVersion.VersionString
+            $osBuild = [string][Environment]::OSVersion.Version.Build
+        }
+
+        if ($PSVersionTable.PSEdition -eq 'Core') { $_psEdition = 'Core' } else { $_psEdition = 'Desktop' }
+
+        $payload = [ordered]@{
+            tool      = $ScriptName
+            version   = $ScriptVersion
+            os        = Limit-Text -Text $osCaption -Max 64
+            osBuild   = Limit-Text -Text $osBuild -Max 32
+            psVersion = Limit-Text -Text $PSVersionTable.PSVersion.ToString() -Max 32
+            psEdition = $_psEdition
+            timezone  = Limit-Text -Text ([TimeZoneInfo]::Local.Id) -Max 64
+            runMode   = $script:RunMode
+        }
+
+        $json = $payload | ConvertTo-Json -Compress
+        Write-Log ('Telemetry payload: {0}' -f $json) -Level Debug
+
+        if ($PSCmdlet.ShouldProcess($TelemetryUrl, 'Send anonymous usage telemetry')) {
+            Enable-ModernTls
+            $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+            Invoke-RestMethod -Uri $TelemetryUrl -Method Post -Body $bytes -ContentType 'application/json' -TimeoutSec 5 -UserAgent $NetworkUserAgent -ErrorAction Stop | Out-Null
+            Write-Log 'Telemetry sent.' -Level Debug
+        }
+    }
+    catch {
+        Write-Log ('Telemetry not sent: {0}' -f $_.Exception.Message) -Level Debug
+    }
+}
+
+function Invoke-UpdateCheckAndTelemetry {
+    <#
+    .SYNOPSIS
+        Runs the optional update check and telemetry. Call it last in the script.
+    .DESCRIPTION
+        Telemetry is on by default (opt-out). It is skipped if -DisableTelemetry is used or
+        either the tool's opt-out variable or DO_NOT_TRACK is set to 1 or true.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($DisableUpdateCheck) {
+        Write-Log 'Update check disabled.' -Level Debug
+    }
+    else {
+        $latest = Get-LatestToolVersion
+        if ($latest -and $latest.Newer) {
+            Show-UpdateNotice -Latest $latest
+        }
+        elseif ($latest) {
+            Write-Log ('Update check: {0} {1} is the latest version.' -f $ScriptName, $ScriptVersion) -Level Debug
+        }
+    }
+
+    $toolOptOut = [Environment]::GetEnvironmentVariable($TelemetryOptOutEnvVar)
+    $doNotTrack = [Environment]::GetEnvironmentVariable('DO_NOT_TRACK')
+    $telemetryOff = $DisableTelemetry -or ($toolOptOut -in '1', 'true') -or ($doNotTrack -in '1', 'true')
+
+    if ($telemetryOff) {
+        Write-Log 'Telemetry disabled.' -Level Debug
+    }
+    else {
+        Write-Log ('Anonymous usage telemetry is on. Disable it with -DisableTelemetry, {0}=1 or DO_NOT_TRACK=1. See {1} in the repository root.' -f $TelemetryOptOutEnvVar, $TelemetryDocName)
+        Send-ToolTelemetry
+    }
+}
+
+# ------------------------------------------------------------------------------
+# Initialisation (runs when the script starts)
+# ------------------------------------------------------------------------------
+$configProblems = @(Test-ToolConfig)
+if ($configProblems.Count -gt 0) {
+    foreach ($problem in $configProblems) {
+        Write-Host ('Configuration error: {0}' -f $problem) -ForegroundColor Red
+    }
+    exit 1
+}
+
+$RunStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+# Apply CONFIG defaults for anything not supplied, then resolve to full paths. The
+# PowerShell location is used for relative paths, not the .NET working directory.
+if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = $DefaultLogPath }
+if ([string]::IsNullOrWhiteSpace($ReportPath)) { $ReportPath = $DefaultReportPath }
+if (-not $PSBoundParameters.ContainsKey('RetentionDays')) { $RetentionDays = $DefaultRetentionDays }
+$LogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogPath)
+$ReportPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReportPath)
+
+# Run mode: a script may preset $script:RunMode to override detection.
+if ($null -eq (Get-Variable -Name RunMode -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) {
+    $script:RunMode = Get-RunMode
+}
+
+# Logging level: an explicit -LoggingLevel wins, then -Debug or -Verbose, then the default.
+$defaultLevelName = $DefaultLoggingLevel
+if ($VerbosePreference -ne 'SilentlyContinue') { $defaultLevelName = 'VERBOSE' }
+if ($DebugPreference -ne 'SilentlyContinue') { $defaultLevelName = 'DEBUG' }
+
+if ([string]::IsNullOrWhiteSpace($LoggingLevel)) { $requestedLevel = $defaultLevelName } else { $requestedLevel = $LoggingLevel }
+
+$resolvedLevel = Resolve-LogLevel -Value $requestedLevel
+$levelWarning = $null
+if ($resolvedLevel -lt 1) {
+    $levelWarning = 'Unrecognised logging level "{0}". Using INFO.' -f (Limit-Text -Text $requestedLevel -Max 32)
+    $resolvedLevel = $logLevelMap['INFO']
+}
+$Script:LogThreshold = $resolvedLevel
+$levelName = $logLevelMap.Keys | Where-Object { $logLevelMap[$_] -eq $Script:LogThreshold } | Select-Object -First 1
+
+Initialize-ToolLogging
+Initialize-EventLogSource
+
+if ($levelWarning) { Write-Log $levelWarning -Level Warn }
+
+Write-LogFile -level Verbose -message 'Logging has been configured'
+Write-LogFile -level Debug -message ('logPath={0}; eventLogSource={1}; eventLogName={2}; template={3}; runMode={4}' -f $LogPath, $EventLogSource, $EventLogName, $TemplateVersion, $script:RunMode)
+Write-LogFile -level Info -message ('{0} {1} starting - logging level is {2}' -f $ScriptName, $ScriptVersion, $levelName)
+#endregion PC-TEMPLATE v1.1.1
+
+# ==============================================================================
+# Script body starts here
+# ==============================================================================
 
 ##################################################
 # Variables
@@ -54,16 +810,11 @@ $tenantID = $config.TenantId
 $applicationID = $config.ClientId
 $applicationThumbprint = $config.clientThumbprint
 
-$date = Get-Date -Format "yyyyMMdd"
-$logPath = "C:\Pickering-Cloud\Logs\OWAManagement\$($date).log"
-$reportPath = "C:\Pickering-Cloud\Reports\OWAManagement\$($date).csv"
-$stateFilePath = "C:\Pickering-Cloud\Reports\OWAManagement\BlockedUsers.psd1"
-
-$ScriptName = 'OutlookWebAccessManagement'
-$ScriptVersion = '1.1.0'
-$UpdateCheckUrl = 'https://pickering.cloud/tools/versions.json'
-$TelemetryUrl = 'https://pickering.cloud/api/telemetry'
-$NetworkUserAgent = 'PickeringCloud-Toolkit'
+# Daily audit CSV, named so the template's retention cleanup recognises it. The state
+# file sits beside it and is never touched by retention (it is not a .csv or .html).
+$reportFile = Join-Path -Path $ReportPath -ChildPath ('{0}_{1}.csv' -f $ScriptName, (Get-Date -Format 'yyyyMMdd'))
+$stateFilePath = Join-Path -Path $ReportPath -ChildPath 'BlockedUsers.psd1'
+$legacyStateFilePath = 'C:\Pickering-Cloud\Reports\OWAManagement\BlockedUsers.psd1'
 
 $mailboxGrantingSkuParts = @(
     "EXCHANGESTANDARD",
@@ -86,162 +837,45 @@ $owaClientParameters = @(
 )
 
 ##################################################
-# Logging/Reporting
+# Reporting
 ##################################################
 
-function Configure-LogPath {
+function Exit-WithError {
     <#
-        .SYNOPSIS
-            Ensures the log directory exists.
-
-        .DESCRIPTION
-            Checks whether the parent directory of $logPath exists, creating it if
-            necessary. Called internally by Write-Log before every write, so the
-            log directory is created on demand rather than requiring manual setup.
-
-        .EXAMPLE
-            Configure-LogPath
-
-            Returns $true if the log directory exists or was created successfully,
-            $false if directory creation failed.
-
-        .OUTPUTS
-            System.Boolean
-
-        .NOTES
-            Relies on the script-scoped $logPath variable rather than taking a
-            parameter, since it's only ever called internally by Write-Log.
+    .SYNOPSIS
+        Logs a Critical message, optionally writes an Error event, and exits with code 1.
+    .DESCRIPTION
+        Replaces the pre-template behaviour where Write-Log -Level CRITICAL also exited
+        the script. The main body runs inside try/finally, so the update check and
+        telemetry still run on this exit path.
+    .PARAMETER Message
+        The reason the run failed.
+    .PARAMETER EventId
+        Optional Application event ID to write as an Error entry.
     #>
-    $logDir = Split-Path -Path $logPath -Parent
-
-    if (-not (Test-Path $logDir)) {
-        Try {
-            New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null
-        }
-        Catch {
-            Write-Error "Failed creating log path: $logDir"
-            return $false
-        }
-    }
-
-    return $true
-}
-
-function Write-Log {
-    <#
-        .SYNOPSIS
-            Writes a timestamped, levelled message to the log file and console.
-
-        .DESCRIPTION
-            Appends an entry to the dated log file at $logPath and echoes it to
-            the console via Write-Host. CRITICAL-level messages exit the script
-            with code 1 after being logged, regardless of whether the log file
-            itself could be written, so a broken logging path can never silently
-            swallow a fatal error.
-
-        .PARAMETER Message
-            The text to log.
-
-        .PARAMETER Level
-            Severity of the entry. One of INFO, WARN, ERROR, CRITICAL. Defaults to
-            INFO. CRITICAL causes the script to exit after logging.
-
-        .EXAMPLE
-            Write-Log -Message "Connected to tenant" -Level INFO
-
-            Logs an informational message.
-
-        .EXAMPLE
-            Write-Log -Message "Service principal not configured." -Level CRITICAL
-
-            Logs a critical error and exits the script with code 1.
-
-        .OUTPUTS
-            None. Writes to the log file and console; exits the script for
-            CRITICAL-level messages.
-
-        .NOTES
-            Depends on the script-scoped $logPath variable via Configure-LogPath.
-    #>
-    param (
-        [Parameter(Mandatory)]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
         [string]$Message,
-        [ValidateSet("DEBUG", "INFO", "WARN", "ERROR", "CRITICAL")]
-        [string]$Level = "INFO"
+
+        [int]$EventId = 0
     )
-    $prefix = "[$Level]"
 
-    if ($Level -eq "DEBUG" -and $DebugPreference -eq "SilentlyContinue") {
-        return
+    Write-Log $Message -Level Critical
+    if ($EventId -gt 0) {
+        Send-LogEvent -EventId $EventId -EntryType Error -Message $Message
     }
-
-    if (Configure-LogPath) {
-<<<<<<< HEAD
-        $time = Get-Date -Format "HH:mm:ss.zzz"
-=======
-        $time = Get-Date -Format "HH:mm:ss.fff"
->>>>>>> origin/main
-        $entry = "$time | $prefix | $Message"
-        Add-Content -Value $entry -Path $logPath
-        Write-Host $entry
-    }
-    else {
-        Write-Host "$prefix | $Message (log file unavailable)" -ForegroundColor Red
-    }
-
-    if ($Level -eq "CRITICAL") {
-        exit 1
-    }
-}
-
-function Configure-ReportPath {
-    <#
-        .SYNOPSIS
-            Ensures the report directory exists.
-
-        .DESCRIPTION
-            Checks whether the parent directory of $reportPath exists, creating it
-            if necessary. Called internally by Write-Report before every write.
-            Directory creation failure is escalated via Write-Log -Level CRITICAL,
-            which halts the script, since a report that can never be written
-            undermines the auditing requirement the script exists to satisfy.
-
-        .EXAMPLE
-            Configure-ReportPath
-
-            Returns $true if the report directory exists or was created
-            successfully. The script exits before returning if creation fails.
-
-        .OUTPUTS
-            System.Boolean
-
-        .NOTES
-            Relies on the script-scoped $reportPath variable rather than taking a
-            parameter, since it's only ever called internally by Write-Report.
-    #>
-    Write-Log "Running Configure-ReportPath" -Level DEBUG
-    $reportDir = Split-Path -Path $reportPath -Parent
-
-    if (-not (Test-Path $reportDir)) {
-        Try {
-            New-Item -ItemType Directory -Path $reportDir -Force -ErrorAction Stop | Out-Null
-        }
-        Catch {
-            Write-Log "Failed creating log path: $reportDir" -Level CRITICAL
-        }
-    }
-
-    return $true
+    exit 1
 }
 
 function Write-Report {
     <#
         .SYNOPSIS
-            Appends a Blocked/Unblocked audit entry to the dated CSV report.
+            Appends a Blocked/Unblocked audit entry to the daily CSV report.
 
         .DESCRIPTION
             Records a single OWA block or unblock action, with timestamp, user
-            details, and reason, to the CSV report at $reportPath. This is the
+            details, and reason, to the CSV report at $reportFile. This is the
             audit trail deliverable for the script - separate from the persistent
             state file, which only tracks current state rather than history.
 
@@ -264,11 +898,11 @@ function Write-Report {
             Appends a single row to the CSV report for this action.
 
         .OUTPUTS
-            None. Appends a row to the CSV report file at $reportPath.
+            None. Appends a row to the CSV report file at $reportFile.
 
         .NOTES
-            Called internally by Block-UserOWA and Unblock-UserOWA. Relies on the
-            script-scoped $reportPath variable.
+            Called internally by Block-UserOWA and Unblock-UserOWA. The report
+            folder is created by Initialize-OutputFolder at the start of the run.
     #>
     param (
         [Parameter(Mandatory)]
@@ -283,21 +917,19 @@ function Write-Report {
 
     Write-Log "Running Write-Report" -Level DEBUG
 
-    if (Configure-ReportPath) {
-        $entry = [PSCustomObject]@{
-            Timestamp         = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            UserPrincipalName = $UserPrincipalName
-            DisplayName       = $DisplayName
-            Action            = $Action
-            Reason            = $Reason
-        }
+    $entry = [PSCustomObject]@{
+        Timestamp         = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        UserPrincipalName = $UserPrincipalName
+        DisplayName       = $DisplayName
+        Action            = $Action
+        Reason            = $Reason
+    }
 
-        Try {
-            $entry | Export-Csv -Path $reportPath -Append -NoTypeInformation -Encoding UTF8 -Force -ErrorAction Stop
-        }
-        Catch {
-            Write-Log -Message "Failed to write report entry for $UserPrincipalName : $($_.Exception.Message)" -Level ERROR
-        }
+    Try {
+        $entry | Export-Csv -Path $reportFile -Append -NoTypeInformation -Encoding UTF8 -Force -ErrorAction Stop
+    }
+    Catch {
+        Write-Log -Message "Failed to write report entry for $UserPrincipalName : $($_.Exception.Message)" -Level ERROR
     }
 }
 
@@ -406,12 +1038,12 @@ function Update-Config {
             Called internally by Connect-TenantMG after New-OWAServicePrincipal
             completes. Relies on the script-scoped $configPath variable.
     #>
-    Write-Log "Running Update-Config" -Level DEBUG
     param(
         [string]$TenantId,
         [string]$ClientId,
         [string]$ClientThumbprint
     )
+    Write-Log "Running Update-Config" -Level DEBUG
 
     $configData = @"
 @{
@@ -502,12 +1134,12 @@ function Connect-TenantMG {
     Write-Log "Running Connect-TenantMG" -Level DEBUG
     if (-not (Test-ServicePrincipalDetails)) {
         if (-not $Setup) {
-            Write-Log -Message "Service principal not configured. Re-run with -Setup to provision it interactively." -Level CRITICAL
+            Exit-WithError "Service principal not configured. Re-run with -Setup to provision it interactively."
         }
 
         $spDetails = New-OWAServicePrincipal
         if ($null -eq $spDetails) {
-            Write-Log -Message "Service principal setup did not complete - aborting." -Level CRITICAL
+            Exit-WithError "Service principal setup did not complete - aborting."
         }
 
         Update-Config -TenantId $spDetails.TenantId -ClientId $spDetails.ClientId -ClientThumbprint $spDetails.ClientThumbprint
@@ -555,7 +1187,7 @@ function Connect-TenantEXO {
         $initialDomain = (Get-MgOrganization).VerifiedDomains | Where-Object { $_.IsInitial } | Select-Object -ExpandProperty Name
     }
     Catch {
-        Write-Log -Message "Failed to retrieve tenant initial domain: $($_.Exception.Message)" -Level CRITICAL
+        Exit-WithError "Failed to retrieve tenant initial domain: $($_.Exception.Message)"
     }
 
     Try {
@@ -564,7 +1196,7 @@ function Connect-TenantEXO {
     }
     Catch {
         Write-Log -Message "Failed to connect to Exchange Online: $($_.Exception.Message)" -Level ERROR
-        Write-Log -Message "If this service principal was created recently, this can be caused by Entra role and certificate propagation delay - wait a few minutes and try again before investigating further." -Level CRITICAL
+        Exit-WithError "If this service principal was created recently, this can be caused by Entra role and certificate propagation delay - wait a few minutes and try again before investigating further."
     }
 }
 
@@ -599,7 +1231,7 @@ function Test-ServicePrincipalDetails {
         return $false
     }
     elseif ([string]::IsNullOrWhiteSpace($applicationThumbprint)) {
-        Write-Log -Message "No certificate thumbprint provided - please update $configPath." -Level CRITICAL
+        Exit-WithError "No certificate thumbprint provided - please update $configPath."
     }
     else {
         return $true
@@ -833,7 +1465,7 @@ function Get-TenantSkuMap {
         $skus = Get-MgSubscribedSku -All -ErrorAction Stop
     }
     Catch {
-        Write-Log -Message "Failed to retrieve subscribed SKUs: $($_.Exception.Message)" -Level CRITICAL
+        Exit-WithError "Failed to retrieve subscribed SKUs: $($_.Exception.Message)"
     }
 
     $skuMap = @{}
@@ -873,7 +1505,7 @@ function Get-AllTenantUsers {
         $allUsers = Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, AssignedLicenses -ErrorAction Stop
     }
     Catch {
-        Write-Log -Message "Failed to retrieve user list: $($_.Exception.Message)" -Level CRITICAL
+        Exit-WithError "Failed to retrieve user list: $($_.Exception.Message)"
     }
 
     Write-Log -Message "Retrieved $($allUsers.Count) user(s) from tenant."
@@ -909,7 +1541,7 @@ function Get-AllTenantMailboxes {
         $allMailboxes = Get-EXOMailbox -ResultSize Unlimited -RecipientTypeDetails UserMailbox -Properties UserPrincipalName -ErrorAction Stop
     }
     Catch {
-        Write-Log -Message "Failed to retrieve mailboxes from Exchange Online: $($_.Exception.Message)" -Level CRITICAL
+        Exit-WithError "Failed to retrieve mailboxes from Exchange Online: $($_.Exception.Message)"
     }
 
     Write-Log -Message "Retrieved $($allMailboxes.Count) mailbox(es) from Exchange Online."
@@ -947,6 +1579,7 @@ function Get-F1LicensedUsers {
         [Parameter(Mandatory)]
         [hashtable]$SkuMap,
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [array]$AllUsers
     )
     Write-Log "Running Get-F1LicensedUsers" -Level DEBUG
@@ -1013,8 +1646,10 @@ function Get-OrphanedMailboxUsers {
         [Parameter(Mandatory)]
         [hashtable]$SkuMap,
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [array]$AllUsers,
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [array]$AllMailboxes
     )
     Write-Log "Running Get-OrphanedMailboxUsers" -Level DEBUG
@@ -1120,7 +1755,10 @@ function Block-UserOWA {
         .NOTES
             Relies on the script-scoped $owaClientParameters variable. Requires an
             active Exchange Online connection with the Exchange Administrator role.
+            Under -WhatIf nothing is changed and $false is returned, so the state
+            file is not updated.
     #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory)]
         [string]$UserPrincipalName,
@@ -1130,6 +1768,10 @@ function Block-UserOWA {
         [string]$Reason
     )
     Write-Log "Running Block-UserOWA" -Level DEBUG
+
+    if (-not $PSCmdlet.ShouldProcess($UserPrincipalName, "Block Outlook client access ($Reason)")) {
+        return $false
+    }
 
     $setParams = @{ Identity = $UserPrincipalName }
     foreach ($param in $owaClientParameters) {
@@ -1176,7 +1818,10 @@ function Unblock-UserOWA {
         .NOTES
             Relies on the script-scoped $owaClientParameters variable. Requires an
             active Exchange Online connection with the Exchange Administrator role.
+            Under -WhatIf nothing is changed and $false is returned, so the user
+            stays in the state file.
     #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory)]
         [string]$UserPrincipalName,
@@ -1184,6 +1829,10 @@ function Unblock-UserOWA {
         [string]$DisplayName
     )
     Write-Log "Running Unblock-UserOWA" -Level DEBUG
+
+    if (-not $PSCmdlet.ShouldProcess($UserPrincipalName, 'Restore Outlook client access')) {
+        return $false
+    }
 
     $setParams = @{ Identity = $UserPrincipalName }
     foreach ($param in $owaClientParameters) {
@@ -1241,6 +1890,7 @@ function Update-OWABlockStatus {
     #>
     param(
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [array]$UsersToBlock,
         [Parameter(Mandatory)]
         [hashtable]$CurrentState
@@ -1358,288 +2008,30 @@ function Save-BlockedUsersState {
     }
 }
 
-function Get-RunMode {
+function Copy-LegacyStateFile {
     <#
         .SYNOPSIS
-            Reports whether the script is running interactively or unattended.
+            Copies the pre-1.2.0 state file to the current location on first run.
 
         .DESCRIPTION
-            Returns 'unattended' if the session is not user-interactive, was started
-            with -NonInteractive, or has redirected input (for example a Scheduled
-            Task). Otherwise returns 'interactive'. The PowerShell ISE and the Visual
-            Studio Code terminal are always treated as interactive.
-
-        .EXAMPLE
-            Get-RunMode
-
-            Returns 'interactive' when run from a normal console window.
-
-        .OUTPUTS
-            System.String
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param()
-
-    if (-not [Environment]::UserInteractive) {
-        return 'unattended'
-    }
-
-    if (@([Environment]::GetCommandLineArgs() | Where-Object { $_ -match '^-NonI' }).Count -gt 0) {
-        return 'unattended'
-    }
-
-    if ($Host.Name -like '*ISE*' -or $Host.Name -like '*Visual Studio Code*') {
-        return 'interactive'
-    }
-
-    try {
-        if ([Console]::IsInputRedirected) {
-            return 'unattended'
-        }
-    }
-    catch {
-        return 'unattended'
-    }
-
-    return 'interactive'
-}
-
-function Limit-Text {
-    <#
-        .SYNOPSIS
-            Removes control characters from a string and truncates it to a maximum length.
-
-        .DESCRIPTION
-            Used to keep telemetry values within the lengths the server accepts.
-
-        .PARAMETER Text
-            The text to clean.
-
-        .PARAMETER Max
-            The maximum number of characters to keep.
-
-        .EXAMPLE
-            Limit-Text -Text 'GMT Standard Time' -Max 64
-
-            Returns the text unchanged, as it is within the limit.
-
-        .OUTPUTS
-            System.String
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param (
-        [Parameter(Mandatory)]
-        [AllowEmptyString()]
-        [string]$Text,
-        [Parameter(Mandatory)]
-        [int]$Max
-    )
-
-    $clean = ($Text -replace '[\x00-\x1F\x7F]', '').Trim()
-    if ($clean.Length -gt $Max) {
-        $clean = $clean.Substring(0, $Max)
-    }
-    return $clean
-}
-
-function Get-LatestToolVersion {
-    <#
-        .SYNOPSIS
-            Reads the latest published version of this tool from the static version file.
-
-        .DESCRIPTION
-            Makes a plain GET request with a generic User-Agent and sends no data.
-            Returns $null if the check fails for any reason, including no network
-            access.
-
-        .EXAMPLE
-            Get-LatestToolVersion
-
-            Returns an object with Version, Released, Url and Newer properties, or $null.
-
-        .OUTPUTS
-            System.Management.Automation.PSCustomObject, or $null.
-    #>
-    [CmdletBinding()]
-    [OutputType([pscustomobject])]
-    param()
-
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        $response = Invoke-RestMethod -Uri $UpdateCheckUrl -Method Get -TimeoutSec 5 -UserAgent $NetworkUserAgent -ErrorAction Stop
-        $entry = $response.tools.$ScriptName
-
-        if (-not $entry) {
-            Write-Log -Message "Update check: $ScriptName is not listed in the version file." -Level INFO
-            return $null
-        }
-
-        $latest = [version](([string]$entry.version -split '-')[0])
-        $current = [version](($ScriptVersion -split '-')[0])
-
-        return [pscustomobject]@{
-            Version  = [string]$entry.version
-            Released = [string]$entry.released
-            Url      = [string]$entry.url
-            Newer    = ($latest -gt $current)
-        }
-    }
-    catch {
-        Write-Log -Message "Update check failed: $($_.Exception.Message)" -Level INFO
-        return $null
-    }
-}
-
-function Show-UpdateNotice {
-    <#
-        .SYNOPSIS
-            Tells the user a newer version exists and, in an interactive session only, offers to open the release page.
-
-        .DESCRIPTION
-            Always writes the notice to the log. In an interactive session, also asks
-            whether to open the release page. Never prompts in an unattended session.
-            Only github.com addresses are opened.
-
-        .PARAMETER Latest
-            The object returned by Get-LatestToolVersion.
-
-        .EXAMPLE
-            Show-UpdateNotice -Latest $latest
-
-            Reports that a newer version is available.
+            Before 1.2.0 the state file lived at a fixed path under
+            C:\Pickering-Cloud. Without it, previously blocked users who no longer
+            need blocking would never be unblocked. The old file is copied, not
+            moved, so it is left in place as a backup.
 
         .OUTPUTS
             None.
     #>
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)]
-        [pscustomobject]$Latest
-    )
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
 
-    Write-Log -Message "Update available: $ScriptName $($Latest.Version) (you have $ScriptVersion). Release page: $($Latest.Url)" -Level INFO
-
-    if ((Get-RunMode) -ne 'interactive') {
+    if ((Test-Path -LiteralPath $stateFilePath) -or -not (Test-Path -LiteralPath $legacyStateFilePath)) {
         return
     }
 
-    $answer = Read-Host 'Open the release page in your browser now? (y/N)'
-
-    if ($answer.Trim().ToLower() -in 'y', 'yes') {
-        # Only open GitHub links, in case the version file were ever tampered with.
-        if ($Latest.Url -match '^https://github\.com/') {
-            Start-Process -FilePath $Latest.Url
-        }
-        else {
-            Write-Log -Message "Not opening $($Latest.Url): it is not a github.com address." -Level WARN
-        }
-    }
-}
-
-function Send-ToolTelemetry {
-    <#
-        .SYNOPSIS
-            Sends anonymous usage telemetry.
-
-        .DESCRIPTION
-            Sends tool name, tool version, OS caption and build, PowerShell version and
-            edition, timezone ID and run mode. The server adds the country from the
-            request and a daily salted hash of the IP address. No tenant, user, mailbox
-            or licence details are ever included. See TELEMETRY.md in the repository
-            root. Run the script with -Verbose to see the exact payload.
-
-        .EXAMPLE
-            Send-ToolTelemetry
-
-            Sends the anonymous usage record for this run.
-
-        .OUTPUTS
-            None.
-    #>
-    [CmdletBinding(SupportsShouldProcess)]
-    param()
-
-    try {
-        try {
-            $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-            $osCaption = [string]$osInfo.Caption
-            $osBuild = [string]$osInfo.BuildNumber
-        }
-        catch {
-            $osCaption = [Environment]::OSVersion.VersionString
-            $osBuild = [string][Environment]::OSVersion.Version.Build
-        }
-
-        $payload = [ordered]@{
-            tool      = $ScriptName
-            version   = $ScriptVersion
-            os        = Limit-Text -Text $osCaption -Max 64
-            osBuild   = Limit-Text -Text $osBuild -Max 32
-            psVersion = Limit-Text -Text $PSVersionTable.PSVersion.ToString() -Max 32
-            psEdition = if ($PSVersionTable.PSEdition -eq 'Core') { 'Core' } else { 'Desktop' }
-            timezone  = Limit-Text -Text ([TimeZoneInfo]::Local.Id) -Max 64
-            runMode   = Get-RunMode
-        }
-
-        $json = $payload | ConvertTo-Json -Compress
-        Write-Verbose "Telemetry payload: $json"
-
-        if ($PSCmdlet.ShouldProcess($TelemetryUrl, 'Send anonymous usage telemetry')) {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-            $bytes = [Text.Encoding]::UTF8.GetBytes($json)
-            Invoke-RestMethod -Uri $TelemetryUrl -Method Post -Body $bytes -ContentType 'application/json' -TimeoutSec 5 -UserAgent $NetworkUserAgent -ErrorAction Stop | Out-Null
-            Write-Verbose 'Telemetry sent.'
-        }
-    }
-    catch {
-        Write-Log -Message "Telemetry not sent: $($_.Exception.Message)" -Level INFO
-    }
-}
-
-function Invoke-UpdateCheckAndTelemetry {
-    <#
-        .SYNOPSIS
-            Runs the optional update check and telemetry, honouring the opt-out switches.
-
-        .DESCRIPTION
-            Skips the update check if -DisableUpdateCheck was used. Skips telemetry if
-            -DisableTelemetry was used or the environment variable
-            PICKERINGCLOUD_NOTELEMETRY is 1 or true. The two are independent. Neither
-            can affect the result of the script.
-
-        .EXAMPLE
-            Invoke-UpdateCheckAndTelemetry
-
-            Checks for a newer version and sends telemetry, unless disabled.
-
-        .OUTPUTS
-            None.
-    #>
-    [CmdletBinding()]
-    param()
-
-    if ($DisableUpdateCheck) {
-        Write-Verbose 'Update check disabled.'
-    }
-    else {
-        $latest = Get-LatestToolVersion
-        if ($latest -and $latest.Newer) {
-            Show-UpdateNotice -Latest $latest
-        }
-        elseif ($latest) {
-            Write-Verbose "Update check: $ScriptName $ScriptVersion is the latest version."
-        }
-    }
-
-    $telemetryOff = $DisableTelemetry -or ($env:PICKERINGCLOUD_NOTELEMETRY -in '1', 'true')
-    if ($telemetryOff) {
-        Write-Verbose 'Telemetry disabled.'
-    }
-    else {
-        Write-Log -Message 'Anonymous usage telemetry is on. Disable it with -DisableTelemetry or PICKERINGCLOUD_NOTELEMETRY=1. See TELEMETRY.md in the repository root.' -Level INFO
-        Send-ToolTelemetry
+    if ($PSCmdlet.ShouldProcess($stateFilePath, "Copy legacy state file from $legacyStateFilePath")) {
+        Copy-Item -LiteralPath $legacyStateFilePath -Destination $stateFilePath -ErrorAction Stop
+        Write-Log -Message "Copied the state file from its pre-1.2.0 location ($legacyStateFilePath) to $stateFilePath." -Level WARN
     }
 }
 
@@ -1648,6 +2040,8 @@ function Invoke-UpdateCheckAndTelemetry {
 ##################################################
 
 try {
+    Initialize-OutputFolder
+
     $requiredModules = @(
         "Microsoft.Graph.Authentication",
         "Microsoft.Graph.Users",
@@ -1673,19 +2067,25 @@ try {
     $orphanedUsers = @(Get-OrphanedMailboxUsers -SkuMap $skuMap -AllUsers $allUsers -AllMailboxes $allMailboxes | Select-Object *, @{Name="Reason"; Expression={"No qualifying mailbox licence"}})
     $targetUsers = $f1Users + $orphanedUsers
 
+    Copy-LegacyStateFile
     $currentState = Get-BlockedUsersState
     $newState = Update-OWABlockStatus -UsersToBlock $targetUsers -CurrentState $currentState
     Save-BlockedUsersState -State $newState
 
     Disconnect-ExchangeOnline -Confirm:$false
     Disconnect-MgGraph
+
+    Remove-ExpiredOutput -Folder $ReportPath -OlderThanDays $RetentionDays
+}
+catch {
+    Exit-WithError "Unhandled error: $($_.Exception.Message)"
 }
 finally {
-    # Runs on every exit path, including Write-Log -Level CRITICAL, which exits the script.
+    # Runs on every exit path, including Exit-WithError.
     try {
         Invoke-UpdateCheckAndTelemetry
     }
     catch {
-        Write-Log -Message "Update check or telemetry error: $($_.Exception.Message)" -Level INFO
+        Write-Log -Message "Update check or telemetry error: $($_.Exception.Message)" -Level Debug
     }
 }

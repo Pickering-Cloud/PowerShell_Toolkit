@@ -4,6 +4,25 @@ All notable changes to this script are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and version numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-11-21
+
+### Changed
+- Adopted the shared toolkit template (PC-TEMPLATE v1.1.1). Logging, the event log, report retention, the update check and telemetry now come from the common template block.
+- Default log and report locations moved to `C:\ProgramData\PickeringCloud\ClientSync\` (`Logs\ClientSync.log` and `Reports\`). The log is a single appended file, rotated at 10 MB.
+- Standard parameters across the toolkit: `-LogPath`, `-LoggingLevel`, `-ReportPath`, `-RetentionDays`, `-DisableUpdateCheck`, `-DisableTelemetry`. `DO_NOT_TRACK=1` now also disables telemetry.
+- Logging runs under `-WhatIf` too, and secrets in log messages are masked.
+
+### Added
+- Restored the 1.1.0 update check and telemetry, which were lost in a merge.
+
+### Deprecated
+- `-OutputRoot` (still honoured, using the previous folder layout). `-CustomLogPath` and `-LogRetentionDays` are now aliases of `-LogPath` and `-RetentionDays`.
+
+### Fixed
+- Event IDs 1002 to 1005 were never written, because the script exited before writing them.
+- The HTML report failed when there were no update errors or no actions taken.
+- The event source is still `WSUS Client Sync Script`, so existing monitoring keeps matching.
+
 ## [1.1.0] - 2026-11-17
 
 ### Added

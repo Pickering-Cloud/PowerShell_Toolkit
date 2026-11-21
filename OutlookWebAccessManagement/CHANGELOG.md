@@ -14,6 +14,54 @@ The format is based on \[Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 
 
+\## \[1.2.0] - 2026-11-21
+
+
+
+\### Changed
+
+
+
+\- Adopted the shared toolkit template (PC-TEMPLATE v1.1.1). Logging, the event log, report retention, the update check and telemetry now come from the common template block.
+
+
+
+\- Default log and report locations moved to `C:\ProgramData\PickeringCloud\OutlookWebAccessManagement\` (`Logs\OutlookWebAccessManagement.log` and `Reports\`). The log is a single appended file, rotated at 10 MB.
+
+
+
+\- Standard parameters across the toolkit: `-LogPath`, `-LoggingLevel`, `-ReportPath`, `-RetentionDays`, `-DisableUpdateCheck`, `-DisableTelemetry`. `DO_NOT_TRACK=1` now also disables telemetry.
+
+
+
+\- Logging runs under `-WhatIf` too, and secrets in log messages are masked.
+
+
+
+\- The daily audit CSV is now `OutlookWebAccessManagement_yyyyMMdd.csv` in `-ReportPath`, and is kept by default (`-RetentionDays 0`). The state file now lives beside it, and an existing `C:\Pickering-Cloud\Reports\OWAManagement\BlockedUsers.psd1` is copied there on first run.
+
+
+
+\- `-WhatIf` is supported and blocks or unblocks nobody.
+
+
+
+\### Fixed
+
+
+
+\- An unresolved merge conflict marker that stopped the script from running.
+
+
+
+\- `-Setup` wrote a config file with blank values.
+
+
+
+\- Previously blocked users were never unblocked once nobody needed blocking.
+
+
+
 \## \[1.0.0] - 2026-08-18
 
 
