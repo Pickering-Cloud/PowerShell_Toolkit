@@ -4,3 +4,4 @@
 TestResults/
 .env
 .secret
+template.ps1

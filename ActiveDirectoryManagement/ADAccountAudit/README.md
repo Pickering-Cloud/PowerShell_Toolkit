@@ -11,7 +11,7 @@ Read-only Active Directory reporting tool for single-crewed or small-team sysadm
 3. **Expiring passwords** — enabled accounts whose password will expire within `-PasswordExpiryWarningDays` (default 14), using the computed `msDS-UserPasswordExpiryTimeComputed` attribute, so fine-grained password policies are respected. Accounts with `PasswordNeverExpires` set are excluded.
 4. **Empty groups** — security groups with zero members. Distribution groups are excluded by default, since they carry no access implications; pass `-IncludeDistributionGroups` to include them.
 
-It's designed to run unattended via Scheduled Task: no prompts, exit code 0 on success, exit code 1 on any fatal error. Old logs and reports beyond the configured retention window are cleaned up automatically at the start of each run.
+It's designed to run unattended via Scheduled Task: no prompts, exit code 0 on success, exit code 1 on any fatal error. Reports older than `-RetentionDays` are cleaned up automatically at the end of each run, and the log file rotates by size.
 
 ## Usage
 
@@ -24,6 +24,9 @@ It's designed to run unattended via Scheduled Task: no prompts, exit code 0 on s
 
 # Scope to a specific OU
 .\ADAccountAudit.ps1 -SearchBase "OU=Users,OU=London,DC=contoso,DC=com"
+
+# Write reports to a share and keep them for 90 days
+.\ADAccountAudit.ps1 -ReportPath \\fileserver\Reports\ADAudit -RetentionDays 90
 ```
 
 ## Parameters
@@ -35,14 +38,30 @@ It's designed to run unattended via Scheduled Task: no prompts, exit code 0 on s
 | `-PrivilegedGroups` | string[] | `Domain Admins, Enterprise Admins, Schema Admins, Administrators` | Groups checked (recursively) for disabled-but-still-privileged membership. |
 | `-SearchBase` | string | domain root | Distinguished name to scope all searches to a specific OU. |
 | `-IncludeDistributionGroups` | switch | off | Also reports empty distribution groups, not just security groups. |
-| `-OutputRoot` | string | `C:\Pickering-Cloud\ADAccountAudit` | Root folder for logs and reports. |
-| `-LogRetentionDays` | int | `30` | Days to retain log and report files before automatic cleanup. |
+| `-LogPath` | string | `C:\ProgramData\PickeringCloud\ADAccountAudit\Logs\ADAccountAudit.log` | Log file location. |
+| `-LoggingLevel` | string | `Info` | `Debug`, `Verbose`, `Info`, `Warn`, `Error`, `Critical` or `None` (or 1 to 7, with 0 also meaning `None`). `-Debug` and `-Verbose` raise it when this is not set. |
+| `-ReportPath` | string | `C:\ProgramData\PickeringCloud\ADAccountAudit\Reports` | Folder for the HTML report and CSV exports. |
+| `-RetentionDays` | int | `30` | Reports older than this are removed. `0` disables cleanup. Only this tool's own reports are removed. |
+| `-DisableUpdateCheck` | switch | off | Skips the check for a newer version. |
+| `-DisableTelemetry` | switch | off | Stops anonymous usage telemetry being sent. |
+| `-OutputRoot` | string | none | **Deprecated.** When supplied, uses the pre-1.1.0 layout: log at `<OutputRoot>\Logs\ADAccountAudit.log`, reports in `<OutputRoot>\Reports`, unless `-LogPath` or `-ReportPath` is also given. |
+| `-LogRetentionDays` | int | | **Deprecated** alias of `-RetentionDays`. |
+
+`-WhatIf` is supported. The audit itself never changes anything, but `-WhatIf` also stops the script installing RSAT if the ActiveDirectory module is missing (the run then stops, since the audit needs the module).
 
 ## Output
 
-- **HTML report** — `<OutputRoot>\Reports\ADAccountAudit_<timestamp>.html`. Colour-coded findings with a summary count at the top.
+- **HTML report** — `<ReportPath>\ADAccountAudit_<timestamp>.html`. Colour-coded findings with a summary count at the top.
 - **CSV exports** — one per finding category, alongside the HTML report: `..._StaleAccounts.csv`, `..._DisabledPrivileged.csv`, `..._ExpiringPasswords.csv`, `..._EmptyGroups.csv`.
-- **Log file** — `<OutputRoot>\Logs\ADAccountAudit_<timestamp>.log`.
+- **Log file** — `<LogPath>`, a single file appended to on every run and rotated at 10 MB.
+
+Versions before 1.1.0 wrote a log per run under `C:\Pickering-Cloud\ADAccountAudit\Logs` and reports under `C:\Pickering-Cloud\ADAccountAudit\Reports` by default. Files already there are left alone. Pass `-OutputRoot C:\Pickering-Cloud\ADAccountAudit` to keep using that location.
+
+## Update check and telemetry
+
+After each run, the script checks `https://pickering.cloud/tools/versions.json` for a newer version (nothing is sent, and nothing is downloaded or installed) and sends anonymous usage telemetry: tool name and version, OS and build, PowerShell version and edition, timezone ID, and whether the run was interactive or unattended. No domain, user, group or host details are ever sent. Neither can affect the result of the run.
+
+Disable them with `-DisableUpdateCheck` and `-DisableTelemetry`, or turn telemetry off for every tool by setting `PICKERINGCLOUD_NOTELEMETRY=1` or `DO_NOT_TRACK=1`. See `TELEMETRY.md` in the repository root for the full policy.
 
 ## Requirements
 

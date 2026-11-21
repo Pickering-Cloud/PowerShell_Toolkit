@@ -69,11 +69,21 @@ Always taken from the command line, never overridden by config.
  
 | Parameter | Type | Default | Description |
 |:---|:---:|:---|:---|
-| `Path` | `string` | none | Path to a single file to sign. If omitted, the interactive file picker is shown instead. |
+| `Path` | `string` | none | Path to a single file to sign. If omitted, the interactive file picker is shown instead. Required in unattended runs (for example `-NonInteractive`), where the picker cannot be shown. |
 | `ConfigFilePath` | `string` | `SignFileConfig.json` alongside the script | Path to the JSON config file. |
 | `BuildConfig` | `switch` | `off` | Writes a template config file to `-ConfigFilePath` using the script's current parameter values, then exits without signing anything. Always overwrites any existing file at that path. |
+| `LogPath` | `string` | `C:\ProgramData\PickeringCloud\FileSigning\Logs\FileSigning.log` | Log file location. |
+| `LoggingLevel` | `string` | `Info` | `Debug`, `Verbose`, `Info`, `Warn`, `Error`, `Critical` or `None` (or 1 to 7, with 0 also meaning `None`). `-Debug` and `-Verbose` raise it when this is not set. |
+| `ReportPath` | `string` | | Standard toolkit parameter. Unused, as this tool writes no reports. |
+| `RetentionDays` | `int` | | Standard toolkit parameter. Unused, as this tool writes no reports. |
 | `DisableUpdateCheck` | `switch` | `off` | Do not check for a newer version. |
 | `DisableTelemetry` | `switch` | `off` | Do not send anonymous usage telemetry. The update check still runs unless `-DisableUpdateCheck` is also used. |
+
+## Logging
+
+Every run appends to a single log file, `C:\ProgramData\PickeringCloud\FileSigning\Logs\FileSigning.log` by default, rotated at 10 MB with five older copies kept. Versions before 1.2.0 wrote a dated file per day under `C:\Pickering-Cloud\Logs\FileSigning\`. Files already there are left alone.
+
+The log is written during `-WhatIf` runs too, so you can review what would have happened. Secrets in log messages are masked on a best-effort basis.
 
 ## Configuration file
 
@@ -85,7 +95,7 @@ Generate a starting template with:
 .\FileSigning.ps1 -BuildConfig -ConfigFilePath .\SignFileConfig.json
 ```
 
-Example schema, see [`SignFileConfig.example.json`](./SignFileConfig.example.json):
+Example schema, see [`SignFileConfig.json.EXAMPLE`](./SignFileConfig.json.EXAMPLE):
 
 ```json
 {
@@ -122,16 +132,16 @@ When the script finishes, it does two optional things. Neither can affect signin
 
 **Update check.** The script reads a small static file (`https://pickering.cloud/tools/versions.json`) and tells you if a newer version is available. It sends no data. In an interactive session it offers to open the release page, and in an unattended run it only writes a line to the log. It never downloads or installs anything. Disable it with `-DisableUpdateCheck`.
 
-**Anonymous usage telemetry.** So the author can see roughly how many installs exist and which platforms to support, the script sends: tool name, tool version, OS name and build, PowerShell version and edition, timezone ID, and whether the run was interactive or unattended. The server adds the country from the request and a hash of the IP address that changes daily and cannot be linked across days. The raw IP address and User-Agent are never stored. File names, certificate details, host names and user names are never sent. Disable it with `-DisableTelemetry`, or for every tool at once by setting the environment variable `PICKERINGCLOUD_NOTELEMETRY=1` (organisations can set this centrally, for example through Group Policy).
+**Anonymous usage telemetry.** So the author can see roughly how many installs exist and which platforms to support, the script sends: tool name, tool version, OS name and build, PowerShell version and edition, timezone ID, and whether the run was interactive or unattended. The server adds the country from the request and a hash of the IP address that changes daily and cannot be linked across days. The raw IP address and User-Agent are never stored. File names, certificate details, host names and user names are never sent. Disable it with `-DisableTelemetry`, or for every tool at once by setting the environment variable `PICKERINGCLOUD_NOTELEMETRY=1` or `DO_NOT_TRACK=1` (organisations can set this centrally, for example through Group Policy).
 
-The two are independent. You can keep update checks and turn telemetry off. Run with `-Verbose` to see the exact telemetry payload in the log. See `TELEMETRY.md` in the repository root for the full policy.
+The two are independent. You can keep update checks and turn telemetry off. Run with `-Debug` to see the exact telemetry payload in the log. See `TELEMETRY.md` in the repository root for the full policy.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Success (files signed, or config file generated via `-BuildConfig`). |
-| `1` | No usable certificate available, no files selected, or one or more files failed to sign. |
+| `1` | No usable certificate available, no files selected (including an unattended run without `-Path`), or one or more files failed to sign. |
 
 The update check and telemetry never change the exit code.
 

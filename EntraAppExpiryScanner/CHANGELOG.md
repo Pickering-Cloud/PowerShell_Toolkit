@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-21
+
+### Changed
+- Adopted the shared toolkit template (PC-TEMPLATE v1.1.1). Logging, the event log, report retention, the update check and telemetry now come from the common template block.
+- Default log and report locations moved to `C:\ProgramData\PickeringCloud\EntraAppExpiryScanner\` (`Logs\EntraAppExpiryScanner.log` and `Reports\`). The log is a single appended file, rotated at 10 MB.
+- Standard parameters across the toolkit: `-LogPath`, `-LoggingLevel`, `-ReportPath`, `-RetentionDays`, `-DisableUpdateCheck`, `-DisableTelemetry`. `DO_NOT_TRACK=1` now also disables telemetry.
+- Logging runs under `-WhatIf` too, and secrets in log messages are masked.
+
+### Fixed
+- `-LoggingLevel 0` (None) previously logged everything.
+- Retention cleanup now only removes this tool's own reports.
+
 ## [1.0.0] - 2026-11-17
 
 ### Added

@@ -31,7 +31,7 @@ Designed to run unattended, including via PowerShell remoting across many machin
 .\WSUS-ClientSync.ps1 -AutomaticallyRemediate
 
 # Use a custom log file location
-.\WSUS-ClientSync.ps1 -CustomLogPath D:\Logs\wsus.log
+.\WSUS-ClientSync.ps1 -LogPath D:\Logs\wsus.log
 
 # Preview what remediation would do, without changing anything
 .\WSUS-ClientSync.ps1 -AutomaticallyRemediate -WhatIf
@@ -39,30 +39,48 @@ Designed to run unattended, including via PowerShell remoting across many machin
 # Skip the update check and telemetry
 .\WSUS-ClientSync.ps1 -DisableUpdateCheck -DisableTelemetry
 
-# Run across many machines via remoting (logging level defaults to Info automatically
-# in a remote session, since the interactive prompt cannot be shown)
-Invoke-Command -ComputerName $computers -FilePath .\WSUS-ClientSync.ps1 -ArgumentList $true
+# Run across many machines via remoting (report only)
+Invoke-Command -ComputerName $computers -FilePath .\WSUS-ClientSync.ps1
+
+# Run across many machines via remoting with remediation. -FilePath can only pass
+# positional arguments, so wrap the script to pass the switch by name.
+$script = [scriptblock]::Create("& { $(Get-Content .\WSUS-ClientSync.ps1 -Raw) } -AutomaticallyRemediate")
+Invoke-Command -ComputerName $computers -ScriptBlock $script
 ```
+
+Runs through PowerShell remoting are always treated as unattended, so the script never prompts in them.
 
 ### Parameters
 
 | Parameter | Type | Default | Description |
 |:---|:---:|:---|:---|
 | `AutomaticallyRemediate` | `switch` | `off` | Attempts automatic fixes for recognised issues rather than only reporting them. |
-| `CustomLogPath` | `string` | `C:\Pickering-Cloud\Logs\WSUS-Client\WSUS-ClientSync.log` | Path to the log file. |
+| `LogPath` | `string` | `C:\ProgramData\PickeringCloud\ClientSync\Logs\ClientSync.log` | Log file location. Appended to on every run and rotated at 10 MB. `-CustomLogPath` still works as an alias. |
+| `LoggingLevel` | `string` | `Info` | `Debug`, `Verbose`, `Info`, `Warn`, `Error`, `Critical` or `None` (or 1 to 7, with 0 also meaning `None`). `-Debug` and `-Verbose` raise it when this is not set. |
+| `ReportPath` | `string` | `C:\ProgramData\PickeringCloud\ClientSync\Reports` | Folder for the HTML report and CSV exports. |
+| `RetentionDays` | `int` | `30` | Reports older than this are removed. `0` disables cleanup. Only this tool's own reports are removed. `-LogRetentionDays` still works as an alias. |
 | `DisableUpdateCheck` | `switch` | `off` | Skips the check for a newer version. |
 | `DisableTelemetry` | `switch` | `off` | Stops anonymous usage telemetry being sent. |
+| `OutputRoot` | `string` | none | **Deprecated.** When supplied, uses the pre-1.2.0 layout: log at `<OutputRoot>\Logs\WSUSClientSync\ClientSync.log`, reports in `<OutputRoot>\Reports\WSUSClientSync`, unless `-LogPath` or `-ReportPath` is also given. |
 
-The script also supports `-WhatIf` and `-Confirm`. With `-WhatIf`, nothing on the machine is changed, no synchronisation is triggered, and no telemetry is sent.
+The script also supports `-WhatIf` and `-Confirm`. With `-WhatIf`, nothing on the machine is changed, no synchronisation is triggered, and no telemetry is sent. The log still records what would have happened.
+
+## Output
+
+| What | Where (defaults) |
+|:---|:---|
+| Log | `C:\ProgramData\PickeringCloud\ClientSync\Logs\ClientSync.log` |
+| HTML report | `C:\ProgramData\PickeringCloud\ClientSync\Reports\ClientSync_<timestamp>.html` |
+| CSV exports | `ClientSync_<timestamp>_Summary.csv`, `_UpdateErrors.csv` and `_ActionsTaken.csv`, alongside the HTML report |
+
+Versions before 1.2.0 used `C:\Pickering-Cloud\Logs\WSUSClientSync\` and `C:\Pickering-Cloud\Reports\WSUSClientSync\`, with files named `WSUSClientSync_<timestamp>`. Files already there are left alone and are no longer cleaned up by retention. Pass `-OutputRoot C:\Pickering-Cloud` to keep using that location.
 
 ## Logging level
 
-If `$loggingLevel` (near the top of the script) is left unset, and the script detects it's running in a normal interactive session, it will prompt for a level (Debug, Verbose, Info, Warn, Error, Critical, or None). If it detects it's running inside a remote session (e.g. via `Invoke-Command`), it defaults to Info automatically rather than prompting, since there's no interactive host available to answer.
-
-To skip the prompt entirely for unattended/scheduled use, edit the default directly near the top of the script:
+The script never prompts for a logging level, so it is safe to run unattended, from a Scheduled Task or through remoting. The default is Info. Use `-LoggingLevel` to change it, or `-Debug` for Debug level, for example:
 
 ```powershell
-[Nullable[int]]$loggingLevel = 3  # Info
+.\WSUS-ClientSync.ps1 -LoggingLevel Warn
 ```
 
 ## Exit codes
@@ -70,7 +88,7 @@ To skip the prompt entirely for unattended/scheduled use, edit the default direc
 | Code | Meaning |
 |:---:|:---|
 | 0 | The script ran to completion. This includes runs where synchronisation failed, so check the event log (events 1007, 1008 and 1016) rather than the exit code to detect a failed sync. |
-| 1 | A critical configuration or connectivity problem stopped the run (events 1002 to 1005). |
+| 1 | A critical configuration or connectivity problem stopped the run (events 1002 to 1005), or an unexpected error stopped it. |
 
 ## Update check and telemetry
 
@@ -78,19 +96,20 @@ When the script finishes it can check for a newer version and send anonymous usa
 
 **Update check.** A plain GET request to `https://pickering.cloud/tools/versions.json` with a generic user agent. Nothing is sent. If a newer version exists the script writes a notice to the log. In an interactive session it also offers to open the release page (GitHub links only). In a remote or unattended session, or with `-WhatIf`, it never prompts. It never downloads or installs anything.
 
-**Telemetry.** A single anonymous POST to `https://pickering.cloud/api/telemetry` containing the tool name and version, OS name and build, PowerShell version and edition, timezone ID and whether the run was interactive or unattended. The server also records the country (taken from the request) and a daily salted hash of the IP address, so repeat use can be counted without storing the address. No WSUS server names, machine names, update titles or error details are ever sent. Run the script with `-Verbose` to see the exact payload. The full disclosure is in `TELEMETRY.md` in the repository root.
+**Telemetry.** A single anonymous POST to `https://pickering.cloud/api/telemetry` containing the tool name and version, OS name and build, PowerShell version and edition, timezone ID and whether the run was interactive or unattended. The server also records the country (taken from the request) and a daily salted hash of the IP address, so repeat use can be counted without storing the address. No WSUS server names, machine names, update titles or error details are ever sent. Run the script with `-Debug` to see the exact payload in the log. The full disclosure is in `TELEMETRY.md` in the repository root.
 
-If you run the script across many machines, each machine makes its own request. Machines without internet access simply skip both (each attempt times out after five seconds and is logged at Info level). To opt out:
+If you run the script across many machines, each machine makes its own request. Machines without internet access simply skip both (each attempt times out after five seconds and is logged at Debug level). To opt out:
 
 | Method | Effect |
 |:---|:---|
 | `-DisableUpdateCheck` | No version check |
 | `-DisableTelemetry` | No telemetry |
 | `PICKERINGCLOUD_NOTELEMETRY=1` (or `true`) | No telemetry in any tool in this toolkit, for every user of the machine if set system-wide |
+| `DO_NOT_TRACK=1` (or `true`) | Same as above, using the common cross-tool convention |
 
 ## Event Log reference
 
-All events are written to the **Application** log under the source **WSUS Client Sync Script**.
+All events are written to the **Application** log under the source **WSUS Client Sync Script** (unchanged from earlier versions, so existing monitoring keeps working). Registering the source needs an elevated session once. Event log writes are skipped in PowerShell 7 and when the source cannot be registered; file logging is unaffected.
 
 | Event ID | Type | Meaning |
 |:---:|:---|:---|

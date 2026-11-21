@@ -21,8 +21,8 @@ The tool is **read-only**. It never changes anything in your tenant.
 - HTML report with summary tiles, plus a CSV export
 - Interactive or app-only authentication (certificate or client secret)
 - Uses Microsoft Graph REST only, so only `Microsoft.Graph.Authentication` is needed
-- Logging to a single appended log file with configurable level, plus Application event log entries
-- Automatic 30-day retention cleanup of old reports
+- Logging to a single appended, size-rotated log file with configurable level, plus Application event log entries
+- Automatic 30-day retention cleanup of old reports (only this tool's own reports are touched)
 - Optional update check and anonymous usage telemetry, each with its own opt-out
 - Findings are reported, not treated as failures, so a successful scan always exits cleanly
 
@@ -88,11 +88,11 @@ Certificate authentication is preferred over a client secret for unattended runs
 | `-NoticeDays` | 60 | Expiring within this many days is Notice |
 | `-HideExpired` | off | Exclude already-expired credentials from the report |
 | `-IncludeHealthy` | off | Include credentials outside the notice window |
-| `-LogPath` | `C:\Pickering-Cloud\Logs\Entra\EntraAppExpiryScanner.log` | Full path of the log file |
-| `-ReportPath` | `C:\Pickering-Cloud\Reports\Entra\EntraAppExpiryScanner\` | Folder for HTML and CSV reports |
-| `-LoggingLevel` | Info (Debug with `-Debug`) | Debug (1), Verbose (2), Info (3), Warn (4), Error (5), Critical (6), None (0). Name or number |
-| `-RetentionDays` | 30 | Remove reports older than this. 0 disables cleanup. The log file is not affected |
 | `-NoModuleInstall` | off | Do not install the Graph module automatically |
+| `-LogPath` | `C:\ProgramData\PickeringCloud\EntraAppExpiryScanner\Logs\EntraAppExpiryScanner.log` | Full path of the log file |
+| `-ReportPath` | `C:\ProgramData\PickeringCloud\EntraAppExpiryScanner\Reports\` | Folder for HTML and CSV reports |
+| `-LoggingLevel` | Info (Debug with `-Debug`, Verbose with `-Verbose`) | Debug (1), Verbose (2), Info (3), Warn (4), Error (5), Critical (6), None (7 or 0). Name or number. An unrecognised value falls back to Info with a warning |
+| `-RetentionDays` | 30 | Remove this tool's reports older than this. 0 disables cleanup. The log file is not affected |
 | `-DisableUpdateCheck` | off | Do not check for a newer version |
 | `-DisableTelemetry` | off | Do not send anonymous usage telemetry. The update check still runs unless `-DisableUpdateCheck` is also used |
 
@@ -101,16 +101,18 @@ Thresholds must satisfy `CriticalDays < WarningDays < NoticeDays`.
 ## Output
 
 ```
-C:\Pickering-Cloud\Logs\Entra\EntraAppExpiryScanner.log
-C:\Pickering-Cloud\Reports\Entra\EntraAppExpiryScanner\EntraAppExpiryScanner_<timestamp>.html
-C:\Pickering-Cloud\Reports\Entra\EntraAppExpiryScanner\EntraAppExpiryScanner_<timestamp>.csv
+C:\ProgramData\PickeringCloud\EntraAppExpiryScanner\Logs\EntraAppExpiryScanner.log
+C:\ProgramData\PickeringCloud\EntraAppExpiryScanner\Reports\EntraAppExpiryScanner_<timestamp>.html
+C:\ProgramData\PickeringCloud\EntraAppExpiryScanner\Reports\EntraAppExpiryScanner_<timestamp>.csv
 ```
 
 The CSV contains one row per finding. The `FindingType` column is `Credential`, `NoOwner` or `NoCredentials`.
 
+Versions before 1.1.0 wrote to `C:\Pickering-Cloud\Logs\Entra\` and `C:\Pickering-Cloud\Reports\Entra\EntraAppExpiryScanner\`. Files already there are left alone. Pass `-LogPath` and `-ReportPath` to keep using those locations.
+
 ## Logging
 
-Logging uses the toolkit standard: `Write-LogFile` for the log file, `Write-LogEvent` for the Windows Application event log. The log file is created read-only on first run and appended to on every run. The script never prompts for a logging level, so it is safe to run unattended. Use `-LoggingLevel` to change it, or `-Debug` for Debug level.
+Logging uses the toolkit standard: one appended log file plus a small set of Windows Application event log entries. The log file is created read-only on first run and appended to on every run. At 10 MB it is rotated, keeping five older copies. The script never prompts for a logging level, so it is safe to run unattended. Use `-LoggingLevel` to change it, or `-Debug` for Debug level. Secrets in log messages are masked on a best-effort basis, and the log is written during `-WhatIf` runs too.
 
 The event log source `EntraAppExpiryScanner` is registered on first run, which needs an elevated session. If registration fails, the scan carries on and file logging is unaffected.
 
@@ -132,7 +134,9 @@ After the scan finishes, the script does two optional things. Neither can affect
 
 **Update check.** The script reads a small static file (`https://pickering.cloud/tools/versions.json`) and tells you if a newer version is available. It sends no data. In an interactive session it offers to open the release page, and in an unattended run it only writes a line to the log. It never downloads or installs anything. Disable it with `-DisableUpdateCheck`.
 
-**Anonymous usage telemetry.** So the author can see roughly how many installs exist and which platforms to support, the script sends: tool name, tool version, OS name and build, PowerShell version and edition, timezone ID, and whether the run was interactive or unattended. The server adds the country from the request and a hash of the IP address that changes daily and cannot be linked across days. The raw IP address and User-Agent are never stored. No tenant, user, host or app registration data is ever sent. Disable it with `-DisableTelemetry`, or for every tool at once by setting the environment variable `PICKERINGCLOUD_NOTELEMETRY=1`.
+**Anonymous usage telemetry.** So the author can see roughly how many installs exist and which platforms to support, the script sends: tool name, tool version, OS name and build, PowerShell version and edition, timezone ID, and whether the run was interactive or unattended. The server adds the country from the request and a hash of the IP address that changes daily and cannot be linked across days. The raw IP address and User-Agent are never stored. No tenant, user, host or app registration data is ever sent. Disable it with `-DisableTelemetry`, or for every tool at once by setting the environment variable `PICKERINGCLOUD_NOTELEMETRY=1` or `DO_NOT_TRACK=1`.
+
+App-only (certificate or client secret) runs are always treated as unattended and never prompt.
 
 The two are independent. You can keep update checks and turn telemetry off. Run with `-Debug` to see the exact telemetry payload in the log. See `TELEMETRY.md` in the repository root for the full policy.
 

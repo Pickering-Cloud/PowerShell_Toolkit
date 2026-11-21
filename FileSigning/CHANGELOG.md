@@ -4,6 +4,18 @@ All notable changes to this script are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and version numbers follow [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-11-21
+
+### Changed
+- Adopted the shared toolkit template (PC-TEMPLATE v1.1.1). Logging, the event log, report retention, the update check and telemetry now come from the common template block.
+- Default log and report locations moved to `C:\ProgramData\PickeringCloud\FileSigning\` (`Logs\FileSigning.log` and `Reports\`). The log is a single appended file, rotated at 10 MB.
+- Standard parameters across the toolkit: `-LogPath`, `-LoggingLevel`, `-ReportPath`, `-RetentionDays`, `-DisableUpdateCheck`, `-DisableTelemetry`. `DO_NOT_TRACK=1` now also disables telemetry.
+- Logging runs under `-WhatIf` too, and secrets in log messages are masked.
+
+### Fixed
+- Unresolved merge conflict markers that stopped the script from running.
+- Unattended runs without `-Path` now fail cleanly instead of trying to show the file picker.
+
 ## [1.1.0] - 2026-11-17
 
 ### Added

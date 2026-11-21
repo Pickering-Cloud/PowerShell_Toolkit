@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-21
+
+### Changed
+- Adopted the shared toolkit template (PC-TEMPLATE v1.1.1). Logging, the event log, report retention, the update check and telemetry now come from the common template block.
+- Default log and report locations moved to `C:\ProgramData\PickeringCloud\ADAccountAudit\` (`Logs\ADAccountAudit.log` and `Reports\`). The log is a single appended file, rotated at 10 MB.
+- Standard parameters across the toolkit: `-LogPath`, `-LoggingLevel`, `-ReportPath`, `-RetentionDays`, `-DisableUpdateCheck`, `-DisableTelemetry`. `DO_NOT_TRACK=1` now also disables telemetry.
+- Logging runs under `-WhatIf` too, and secrets in log messages are masked.
+
+### Added
+- Update check and anonymous telemetry, as in the rest of the toolkit.
+
+### Deprecated
+- `-OutputRoot` (still honoured, using the previous folder layout) and `-LogRetentionDays` (now an alias of `-RetentionDays`).
+
+### Fixed
+- The run failed whenever any finding set was empty.
+- `-WhatIf` no longer installs RSAT.
+
 ## [1.0.0] - 2026-08-22
 
 ### Added

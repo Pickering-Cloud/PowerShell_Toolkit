@@ -6,12 +6,26 @@ The tools in this repository can make two network requests to pickering.cloud. B
 
 The tools and the service behind them are written and run by me, Bradley Pickering, as a personal project. The service runs on a server I manage, behind Cloudflare.
 
+## Which tools take part
+
+These tools make the update check and send telemetry. The name in the second column is the value sent in the `tool` field.
+
+| Tool | `tool` value |
+|------|--------------|
+| [ADAccountAudit](ActiveDirectoryManagement/ADAccountAudit/README.md) | `ADAccountAudit` |
+| [EntraAppExpiryScanner](EntraAppExpiryScanner/README.md) | `EntraAppExpiryScanner` |
+| [FileSigning](FileSigning/README.md) | `FileSigning` |
+| [OutlookWebAccessManagement](OutlookWebAccessManagement/README.md) | `OutlookWebAccessManagement` |
+| [WSUS-ClientSync](WSUS/ClientSync/README.md) | `ClientSync` |
+
+Both requests happen after the tool has finished its work, and neither can change its result or exit code. A run with `-WhatIf` never sends telemetry.
+
 ## Update check
 
 Each tool can download a small file listing the latest version of every tool:
 
 ```
-GET https://www.pickering.cloud/tools/versions.json
+GET https://pickering.cloud/tools/versions.json
 ```
 
 The tool compares the version in that file with its own and tells you if a newer one is available. Nothing about you or your environment is sent. As with any web request, your IP address and your PowerShell User-Agent string reach the server, but requests for this file are not logged.
@@ -21,7 +35,7 @@ The tool compares the version in that file with its own and tells you if a newer
 If you have not opted out, each tool sends one small report when it runs:
 
 ```
-POST https://www.pickering.cloud/api/telemetry
+POST https://pickering.cloud/api/telemetry
 ```
 
 This tells me roughly how many installations exist, which versions are in use and which platforms they run on. That helps me decide what to support and test.
@@ -65,9 +79,9 @@ Records are deleted automatically 365 days after the day they relate to. There i
 
 Telemetry and update checks are controlled separately. Turning one off does not affect the other.
 
-- **Turn off telemetry for one run:** add the `-NoTelemetry` switch.
-- **Turn off update checks for one run:** add the `-NoUpdateCheck` switch.
-- **Turn off telemetry permanently:** set the environment variable `PICKERINGCLOUD_NOTELEMETRY` to `1`. For example, for your user account:
+- **Turn off telemetry for one run:** add the `-DisableTelemetry` switch.
+- **Turn off update checks for one run:** add the `-DisableUpdateCheck` switch.
+- **Turn off telemetry permanently:** set the environment variable `PICKERINGCLOUD_NOTELEMETRY` to `1` (or `true`). The tools also honour the general-purpose `DO_NOT_TRACK` variable in the same way. For example, for your user account:
 
   ```powershell
   [Environment]::SetEnvironmentVariable('PICKERINGCLOUD_NOTELEMETRY', '1', 'User')
