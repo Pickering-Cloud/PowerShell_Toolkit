@@ -1,0 +1,7 @@
+{
+  "targetVersions": ["5.1", "7"],
+  "indent": { "style": "spaces", "size": 4, "detect": false },
+  "lineEnding": "crlf",
+  "exclude": [],
+  "rules": {}
+}

@@ -977,7 +977,7 @@ function New-SignFileConfig {
         $UsePersonalCertificateJSON = $null
     }
     $configTemplate = [ordered]@{
-        RequireADCSCertificate = $RequireADCSCertificateJSON 
+        RequireADCSCertificate = $RequireADCSCertificateJSON
         UsePersonalCertificate = $UsePersonalCertificateJSON
         CompanyName            = $CompanyName
         ValidityLength         = $CertificateValidity
@@ -1081,7 +1081,7 @@ function Get-ScriptVariables {
         [int]$keyLength,
         [string]$timestampServer
     )
-    <## 
+    <##
     Policy-governed settings. If a config file is present, its values always win over
     whatever was passed at the command line, since the intent is that IT controls these
     centrally and developers cannot silently override them by passing different switches.
@@ -1091,7 +1091,7 @@ function Get-ScriptVariables {
 
         try {
             $config = Get-Content -Path $configFilePath -Raw | ConvertFrom-Json -ErrorAction Stop
-        } 
+        }
         catch {
             Exit-WithError "Failed to parse config file $($configFilePath): $($_.Exception.Message)"
         }
@@ -1105,8 +1105,8 @@ function Get-ScriptVariables {
 
         if ($null -ne $config.UsePersonalCertificate) {
             $usePersonalCertificate = [bool]$config.UsePersonalCertificate
-        } 
-        
+        }
+
         if ($null -ne $config.CompanyName) {
             $companyName = $config.CompanyName
         }
@@ -1184,7 +1184,7 @@ function Get-ExistingCodeSigningCert {
         if ($codeSigningCerts) {
             $codeSigningCert = $codeSigningCerts | Where-Object { $_.NotAfter -gt (Get-Date) -and $_.HasPrivateKey -eq $true } | Select-Object -First 1
         }
-        
+
         if ($codeSigningCert) {
             Write-Log -Message "Found existing usable code signing certificate: $($codeSigningCert.Thumbprint), expires $($codeSigningCert.NotAfter)."
             return $codeSigningCert
@@ -1281,20 +1281,20 @@ function New-CodesigningCert {
     param(
         [Alias("CertificateStore")]
         [Parameter(
-            Mandatory    
+            Mandatory
         )]
         [string]$CertStore,
 
         [Parameter()]
         [switch]$ADCSRequired,
-        
+
         [Parameter()]
         [string]$CompanyName,
-        
+
         [Parameter()]
         [ValidateSet(2048, 3072, 4096)]
         [int]$KeyLength,
-        
+
         [Parameter()]
         [ValidateRange(1, 25)]
         [int]$ValidityLength,
@@ -1414,9 +1414,9 @@ function New-CodesigningCert {
             }
         }
     }
-    
+
     return $newCert
-        
+
 }
 
 # Get file(s)
