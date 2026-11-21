@@ -16,6 +16,7 @@ These tools make the update check and send telemetry. The name in the second col
 | [EntraAppExpiryScanner](EntraAppExpiryScanner/README.md) | `EntraAppExpiryScanner` |
 | [FileSigning](FileSigning/README.md) | `FileSigning` |
 | [OutlookWebAccessManagement](OutlookWebAccessManagement/README.md) | `OutlookWebAccessManagement` |
+| [PSAnalyser](PSAnalyser/README.md) | `PSAnalyser` |
 | [WSUS-ClientSync](WSUS/ClientSync/README.md) | `ClientSync` |
 
 Both requests happen after the tool has finished its work, and neither can change its result or exit code. A run with `-WhatIf` never sends telemetry.
@@ -25,7 +26,7 @@ Both requests happen after the tool has finished its work, and neither can chang
 Each tool can download a small file listing the latest version of every tool:
 
 ```
-GET https://pickering.cloud/tools/versions.json
+GET https://www.pickering.cloud/tools/versions.json
 ```
 
 The tool compares the version in that file with its own and tells you if a newer one is available. Nothing about you or your environment is sent. As with any web request, your IP address and your PowerShell User-Agent string reach the server, but requests for this file are not logged.
@@ -35,7 +36,7 @@ The tool compares the version in that file with its own and tells you if a newer
 If you have not opted out, each tool sends one small report when it runs:
 
 ```
-POST https://pickering.cloud/api/telemetry
+POST https://www.pickering.cloud/api/telemetry
 ```
 
 This tells me roughly how many installations exist, which versions are in use and which platforms they run on. That helps me decide what to support and test.

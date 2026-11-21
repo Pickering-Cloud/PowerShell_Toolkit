@@ -1,0 +1,8 @@
+# PSAnalyser lints itself and expects CRLF line endings, so check its files out as
+# CRLF whatever the local core.autocrlf setting is. The test fixtures have their own
+# .gitattributes that turns conversion off, since they are compared byte for byte.
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+*.json text eol=crlf
+*.md   text eol=crlf

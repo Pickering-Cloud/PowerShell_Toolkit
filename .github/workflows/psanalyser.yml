@@ -1,0 +1,57 @@
+name: PSAnalyser tests
+
+on:
+  push:
+    paths:
+      - 'PSAnalyser/**'
+      - '.github/workflows/psanalyser.yml'
+  pull_request:
+    paths:
+      - 'PSAnalyser/**'
+      - '.github/workflows/psanalyser.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pester:
+    name: Pester on ${{ matrix.shell == 'powershell' && 'Windows PowerShell 5.1' || 'PowerShell 7' }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Show engine
+        shell: ${{ matrix.shell }}
+        run: $PSVersionTable | Format-Table -AutoSize | Out-String
+
+      - name: Install Pester 5
+        shell: ${{ matrix.shell }}
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run tests
+        shell: ${{ matrix.shell }}
+        run: |
+          Import-Module -Name Pester -RequiredVersion 5.7.1
+          New-Item -Path TestResults -ItemType Directory -Force | Out-Null
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'PSAnalyser/tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'TestResults/pester-${{ matrix.shell }}.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-${{ matrix.shell }}
+          path: TestResults/

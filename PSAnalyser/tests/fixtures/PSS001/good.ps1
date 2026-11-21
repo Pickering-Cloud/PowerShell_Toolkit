@@ -1,0 +1,2 @@
+& $scriptBlock
+Get-Date
